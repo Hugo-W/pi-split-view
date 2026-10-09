@@ -6,15 +6,15 @@ usage), an optional right files dock with an edit-diff subpanel, and a response-
 transcript mode — composed as one clean layout layer over pi's native transcript and editor.
 
 ```
-╭ Thinking ──────────────────────────────────────╮╭ Tool Usage ───────────╮
-│ …live reasoning stream…                        ││ ✓ bash {"command":…  │
-│                                                ││ ✓ read  path/file.ts │
-╰────────────────────────────────────────────────╯╰──────────────────────╯
-────────────────────────────────────────────────────────────────────────────
- transcript (or response-only view)                    ┃╭ Files (3)       ╮┃
- >                                                     ┃│ w src/panel.ts  │┃
-──────────────────────────────────────────────────────┃│ ✎ diff preview  │┃
- model · context · status                              ┃╰─────────────────╯┃
+╭ Thinking ──────────────────────────────────────╮ ╭ Tool Usage ───────────╮
+│ …live reasoning stream…                        │ │ ✓ bash {"command":…   │
+│                                                │ │ ✓ read  path/file.ts  │
+╰────────────────────────────────────────────────╯ ╰───────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────╮
+ transcript (or response-only view)                     ╭ Files (3) ──────╮│
+ >                                                      │ w src/panel.ts  ││
+─────────────────────────────────────────────────────── │ ✎ diff preview  ││
+ model · context · status                               ╰─────────────────╯
 ```
 
 ## Example
