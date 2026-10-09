@@ -66,6 +66,8 @@ The three files are plain TypeScript loaded by pi's extension discovery — no b
 # install as a pi package (npm or git)
 pi install npm:pi-split-view
 pi install git:github.com/Hugo-W/pi-split-view
+# try it once without installing
+pi -e npm:pi-split-view
 
 # or copy the sources into your pi agent extensions dir
 cp split-view.ts layout-manager.ts ui-panels-config.ts ~/.pi/agent/extensions/
