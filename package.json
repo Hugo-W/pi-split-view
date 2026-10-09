@@ -20,10 +20,14 @@
 		"layout-manager.ts",
 		"ui-panels-config.ts",
 		"README.md",
-		"LICENSE"
+		"LICENSE",
+		"assets/screenshot-band-files.png"
 	],
 	"pi": {
-		"extensions": ["./split-view.ts"]
+		"extensions": [
+			"./split-view.ts"
+		],
+		"image": "./assets/screenshot-band-files.png"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",

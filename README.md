@@ -17,6 +17,10 @@ transcript mode — composed as one clean layout layer over pi's native transcri
  model · context · status                              ┃╰─────────────────╯┃
 ```
 
+## Example
+
+![split-view: thinking/tool band, transcript, files dock with edit-diff subpanel](assets/screenshot-band-files.png)
+
 ## Features
 
 - **Thinking panel** — live reasoning stream (coalesced flushes, bounded buffers), newest
