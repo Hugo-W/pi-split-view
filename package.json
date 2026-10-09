@@ -1,6 +1,6 @@
 {
 	"name": "pi-split-view",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"description": "Split-view TUI extension for the pi coding agent: thinking/tool band, files dock with edit-diff subpanel, response-only transcript mode",
 	"license": "MIT",
 	"repository": {
