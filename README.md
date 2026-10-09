@@ -59,10 +59,13 @@ regular mode.
 The three files are plain TypeScript loaded by pi's extension discovery — no build step.
 
 ```sh
-# 1. copy the sources into your pi agent extensions dir
-cp split-view.ts layout-manager.ts ui-panels-config.ts ~/.pi/agent/extensions/
+# install as a pi package (npm or git)
+pi install npm:pi-split-view
+pi install git:github.com/Hugo-W/pi-split-view
 
-# 2. (restart pi, or /reload if already running)
+# or copy the sources into your pi agent extensions dir
+cp split-view.ts layout-manager.ts ui-panels-config.ts ~/.pi/agent/extensions/
+# (restart pi, or /reload if already running)
 ```
 
 Or load it once without installing:
