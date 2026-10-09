@@ -1258,9 +1258,9 @@ function buildBand(theme: Theme, inner: Component): Component {
 		dispose(): void {}
 		render(w: number): string[] {
 			return [
-				theme.fg("border", "├") +
+				theme.fg("border", "╭") +
 					theme.fg("border", "─".repeat(Math.max(0, w - 2))) +
-					theme.fg("border", "┤"),
+					theme.fg("border", "╮"),
 			];
 		}
 	})();
