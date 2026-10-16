@@ -1182,6 +1182,122 @@ function framedPanel(
 	]);
 }
 
+/** Symbol.for key: the frame's saved state survives a /reload'd module. */
+const TRANSCRIPT_FRAME: unique symbol = Symbol.for("pi-split-view.transcript-frame");
+
+/** Pi's own transcript state, saved before the frame changes it. */
+interface TranscriptFrameSaved {
+	child: Component;
+	scrollbar: Parameters<ScrollView["setScrollbar"]>[0];
+	trackStyle: (text: string) => string;
+	thumbStyle: (text: string) => string;
+}
+
+type TranscriptScroll = ScrollView & {
+	[TRANSCRIPT_FRAME]?: TranscriptFrameSaved;
+};
+
+/**
+ * Blue │ left edge for the transcript: renders its child one column narrower
+ * and prefixes every row. The right edge is the ScrollView's always-on
+ * scrollbar column (see frameTranscript), so the child never paints there.
+ */
+class TranscriptEdge implements Component {
+	private paddedRows = -1;
+	constructor(
+		private theme: Theme,
+		private child: Component,
+		/** Viewport rows, so short content still gets the edge on every row. */
+		private viewportRows: () => number,
+	) {}
+	render(width: number): string[] {
+		const edge = this.theme.fg("border", "│");
+		const lines = this.child
+			.render(Math.max(1, width - 1))
+			.map((line) => edge + line);
+		const rows = this.viewportRows();
+		// The ScrollView measures its viewport after this render. If the row
+		// count moved, draw once more so the edge reaches the measured last row.
+		if (rows !== this.paddedRows) {
+			this.paddedRows = rows;
+			requestRender();
+		}
+		const blank = edge + " ".repeat(Math.max(0, width - 1));
+		while (lines.length < rows) lines.push(blank);
+		return lines;
+	}
+	invalidate(): void {
+		this.child.invalidate();
+	}
+	dispose(): void {}
+}
+
+/**
+ * Frame a transcript ScrollView like framedPanel: TranscriptEdge gives the
+ * left │, and the always-on scrollbar is the right edge (track and idle thumb
+ * in border). The first call saves Pi's child, scrollbar and styles.
+ */
+function frameTranscript(theme: Theme, scroll: TranscriptScroll): void {
+	const saved = (scroll[TRANSCRIPT_FRAME] ??= {
+		child: scroll.child,
+		scrollbar: scroll.scrollbar,
+		trackStyle: scroll.scrollbarTrackStyle,
+		thumbStyle: scroll.scrollbarThumbStyle,
+	});
+	scroll.child = new TranscriptEdge(theme, saved.child, () => scroll.viewportHeight);
+	scroll.setScrollbar("always");
+	scroll.scrollbarTrackStyle = (t: string) => theme.fg("border", t);
+	scroll.scrollbarThumbStyle = (t: string) =>
+		theme.fg(t === "█" ? "accent" : "border", t === "┃" ? "│" : t);
+}
+
+/** Restore Pi's child, scrollbar and styles; no-op if never framed. */
+function unframeTranscript(scroll: TranscriptScroll): void {
+	const saved = scroll[TRANSCRIPT_FRAME];
+	if (!saved) return;
+	delete scroll[TRANSCRIPT_FRAME];
+	scroll.child = saved.child;
+	scroll.setScrollbar(saved.scrollbar);
+	scroll.scrollbarTrackStyle = saved.trackStyle;
+	scroll.scrollbarThumbStyle = saved.thumbStyle;
+}
+
+/** Pi's own transcript ScrollView in the base root (the entry with a `child`). */
+function baseTranscriptOf(base: any): TranscriptScroll | null {
+	const entries = base?.entries;
+	if (!Array.isArray(entries)) return null;
+	for (const e of entries) {
+		const c = e?.component;
+		if (c && Object.hasOwn(c, "child")) return c as TranscriptScroll;
+	}
+	return null;
+}
+
+/** Frame (theme) or unframe (null) the transcript views composition can show. */
+function setTranscriptFrame(theme: Theme | null): void {
+	for (const scroll of [baseTranscriptOf(getBaseRoot()), responseScrollView]) {
+		if (!scroll) continue;
+		if (theme) frameTranscript(theme, scroll);
+		else unframeTranscript(scroll);
+	}
+}
+
+/**
+ * Close the transcript box with a fixed ╰──╯ row between the transcript and
+ * the input dock. The row sits outside the ScrollView, so it never scrolls.
+ * Uses the root's own two entries (transcript, dock); any other shape gets
+ * no edge.
+ */
+function withBottomEdge(theme: Theme, root: Component): Component {
+	const entries = (root as any)?.entries;
+	if (!Array.isArray(entries) || entries.length !== 2) return root;
+	return new MeasurementSafeVStack([
+		{ ...entries[0] },
+		{ component: new BorderBottom(theme), basis: 1, grow: 0, shrink: 0 },
+		{ ...entries[1] },
+	]);
+}
+
 function buildBand(theme: Theme, inner: Component): Component {
 	const panels: { component: Component; basis: number; grow: number }[] = [];
 	const minRows = () => Math.max(1, bandHeight - 2);
@@ -1256,17 +1372,14 @@ function buildBand(theme: Theme, inner: Component): Component {
 		panels.length === 1
 			? panels[0]!.component
 			: new HStack(panels.map((p) => ({ ...p, shrink: 1, minSize: 1 })));
-	const sep = new (class implements Component {
-		invalidate(): void {}
-		dispose(): void {}
-		render(w: number): string[] {
-			return [
-				theme.fg("border", "╭") +
-					theme.fg("border", "─".repeat(Math.max(0, w - 2))) +
-					theme.fg("border", "╮"),
-			];
-		}
-	})();
+	// The transcript's top edge, titled like the band panels (Tool Usage style).
+	// No agent-running flag exists for the transcript, so the dot stays off.
+	const sep = new BorderTop(
+		theme,
+		trimResponse ? "Response" : "Transcript",
+		"muted",
+		() => false,
+	);
 	return new VStack([
 		{
 			component: band,
@@ -1408,7 +1521,8 @@ function composeLayout(theme: Theme, inner: Component): Component {
 		if (trimmed) root = trimmed;
 	}
 	const wantBand = thinkingOn || toolsOn;
-	if (wantBand) root = buildBand(theme, root);
+	setTranscriptFrame(wantBand ? theme : null);
+	if (wantBand) root = buildBand(theme, withBottomEdge(theme, root));
 	if (filesOn && tuiRef && typeof tuiRef.setLayoutRoot === "function")
 		root = buildFilesDock(theme, root);
 	return root;
@@ -1418,6 +1532,7 @@ function composeLayout(theme: Theme, inner: Component): Component {
 function reconcileLayout(theme: Theme): void {
 	const wantAny = thinkingOn || toolsOn || filesOn || trimResponse;
 	if (!wantAny || !tuiRef || typeof tuiRef.setLayoutRoot !== "function") {
+		setTranscriptFrame(null);
 		if (isLayoutLayerActive("ui")) setLayoutLayer("ui", null);
 		return;
 	}
