@@ -71,6 +71,11 @@
  * wrapped/styled output on a (version, width) key; unchanged frames are O(1).
  * requestRender() is gated on any panel being active.
  *
+ * Mouse (fullscreen): header [↗]/[×] buttons zoom / hide a panel; drag the
+ * band bottom border (height), the tools panel's left edge (split) and the
+ * files dock's left edge (width). Drags mutate the composed stack entries in
+ * place (applyGeometry) so panel scroll positions survive.
+ *
  * Shortcuts (ctrl+o/ctrl+t) are dropped: reserved built-ins, un-registrable.
  */
 
@@ -92,6 +97,8 @@ import {
 	VStack,
 	type Component,
 	type OverlayHandle,
+	type TuiMouseEvent,
+	type TuiMouseEventResult,
 	wrapTextWithAnsi,
 	truncateToWidth,
 	visibleWidth,
@@ -109,6 +116,15 @@ import {
 	isLayoutLayerActive,
 	selfHealLayout,
 } from "./layout-manager.ts";
+import {
+	appendStreamTail,
+	bandToolsColsFor as bandToolsColsForPct,
+	capDisplayLine,
+	capToolText,
+	dockColsFor as dockColsForManual,
+	formatDuration,
+	truncateInline,
+} from "./helpers.ts";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
@@ -119,19 +135,24 @@ const MAX_TOOLS = 60;
 // keeps everything; the band is a recent-history view. Must stay small: the
 // per-flush render cost is dominated by wrapping the visible window.
 const MAX_LINES = 400;
-// A newline-free streaming tail grows char by char; every flush re-wraps it
-// (its key changes each time). Render only its recent suffix so per-flush
-// work is bounded even for one giant paragraph.
-const MAX_TAIL_CHARS = 2000;
+// A newline-free streaming tail grows char by char and re-wraps on every
+// flush. Bounded by dropping its older HALF on overflow (appendStreamTail),
+// so the visible paragraph re-flows once per ~8K chars, not on every flush.
+const MAX_TAIL_CHARS = 16000;
 const MAX_FILES = 500;
 const MAX_WIDGET_NAMES = 3;
 const MIN_TERM_WIDTH = 90;
 const MAX_TOOL_OUTPUT_LINES = 20;
 // OracleSpec body window: hard cap on FINAL VISUAL rows rendered by band
-// panels (logical lines can wrap into many). ~2 viewports of scrollback.
-const MAX_BODY_ROWS = 96;
-// Hard cap on raw chars processed per logical line (giant-line guard).
-const MAX_LINE_CHARS = 600;
+// panels (logical lines can wrap into many). Wrapped rows are memoized per
+// line, so only changed lines (the streaming tail) re-wrap on a flush.
+const MAX_BODY_ROWS = 400;
+// Hard cap on raw chars per logical line (giant-line guard). ≥ MAX_TAIL_CHARS
+// so the streaming tail is never cut by a sliding (re-flowing) window.
+const MAX_LINE_CHARS = MAX_TAIL_CHARS;
+/** Rows the transcript + editor need below the band; shorter terminals hide
+ * the band (B2) instead of squeezing the transcript. */
+const MIN_ROWS_BELOW_BAND = 12;
 
 /** Legend shown at the bottom of the files list. */
 const LEGEND = "r read · w write · s seen(bash) · a subagent";
@@ -185,6 +206,16 @@ let bandHeight = 14;
 /** F: tools panel's share of the band width in percent (20–60, default 35,
  * persisted as toolsWidthPct; session-local, only /split-save writes it). */
 let toolsWidthPct = 35;
+/** Files dock width in cols set by dragging its edge (null = auto 25%,
+ * 34–48). Session-local; persisted by /split-save as filesWidth. */
+let filesWidth: number | null = null;
+/** Panel expanded to the whole area above the editor (header ↗ button).
+ * Transient: never persisted. */
+type PanelId = "thinking" | "tools" | "files";
+let zoomed: PanelId | null = null;
+
+const bandToolsColsFor = (total: number) => bandToolsColsForPct(total, toolsWidthPct);
+const dockColsFor = (cols: number) => dockColsForManual(cols, filesWidth);
 
 /** SV-08: fingerprint of the live theme's panel-relevant colors, captured
  * when the composition was built. pi replaces the global theme object on a
@@ -223,7 +254,7 @@ interface ThinkingBlock {
  * frames don't queue behind 5000-line re-wraps. Complete blocks + end() are
  * unaffected (they bump synchronously).
  */
-const THINK_RAF_MS = 100;
+const THINK_RAF_MS = 50;
 let thinkFlushTimer: ReturnType<typeof setTimeout> | null = null;
 let thinkDirty = false;
 
@@ -290,16 +321,15 @@ const thinking = {
 	},
 	append(delta: string) {
 		if (!this.current) this.current = { lines: [], tail: "", complete: false };
-		this.current.tail += delta;
-		if (this.current.tail.length > MAX_TAIL_CHARS)
-			this.current.tail = this.current.tail.slice(-MAX_TAIL_CHARS);
-		let nl = this.current.tail.indexOf("\n");
-		while (nl !== -1) {
-			this.current.lines.push(this.current.tail.slice(0, nl));
-			this.current.tail = this.current.tail.slice(nl + 1);
-			nl = this.current.tail.indexOf("\n");
-		}
-		this.trim();
+		// Split complete lines first, then cap the tail (half-drop on overflow).
+		const before = this.current.lines.length;
+		this.current.tail = appendStreamTail(
+			this.current.lines,
+			this.current.tail,
+			delta,
+			MAX_TAIL_CHARS,
+		);
+		if (this.current.lines.length !== before) this.trim();
 		thinkDirty = true;
 		if (!thinkFlushTimer)
 			thinkFlushTimer = setTimeout(flushThinking, THINK_RAF_MS);
@@ -567,51 +597,33 @@ interface ToolEntry {
 	isError: boolean;
 	subagent?: boolean;
 	agent?: string;
+	/** Wall-clock start/end (ms) of LIVE calls; absent for resumed history. */
+	startedAt?: number;
+	endedAt?: number;
 }
 const toolsBy = new Map<string, ToolEntry>();
 const toolOrder: string[] = [];
 
-/** True if c is a UTF-16 high (lead) surrogate — the first half of an astral
- * code point. Used to keep truncation cuts off surrogate-pair boundaries. */
-function isHighSurrogate(c: number): boolean {
-	return c >= 0xd800 && c <= 0xdbff;
-}
-
-function truncateInline(s: string, max = 40): string {
-	const flat = s.replace(/\s+/g, " ").trim();
-	if (flat.length <= max) return flat;
-	let end = max - 1;
-	// Never end mid surrogate pair (a lone trailing half renders as U+FFFD).
-	if (end >= 1 && isHighSurrogate(flat.charCodeAt(end - 1))) end--;
-	return flat.slice(0, end) + "…";
-}
-
-/** SV-16: storage cap for one tool's text (args JSON or result output), in
- * UTF-16 code units (≈ in-memory size of the stored string). Below pi's own
- * bash-output cap (50KB) so even maximal tool output is bounded here, and
- * ~2.7× the maximum displayed content (20 lines × 600 chars). */
-const MAX_TOOL_TEXT_CHARS = 32 * 1024;
-
-/** SV-16: bound one tool text to MAX_TOOL_TEXT_CHARS, keeping the NEWEST
- * suffix and prepending an explicit truncation marker. The cut is aligned to
- * a code point so a UTF-16 surrogate pair is never split. Text within the
- * cap passes through unchanged (byte-identical). */
-function capToolText(s: string): string {
-	if (s.length <= MAX_TOOL_TEXT_CHARS) return s;
-	const total = s.length;
-	const marker = `[truncated: newest ${MAX_TOOL_TEXT_CHARS} of ${total} chars]\n`;
-	const budget = MAX_TOOL_TEXT_CHARS - marker.length;
-	let end = s.length;
-	let units = 0;
-	while (end > 0 && units < budget) {
-		// Width of the code point ENDING at `end`: an astral char occupies
-		// end-2..end-1 (lead surrogate at end-2), so a pair is never split.
-		const w = end >= 2 && isHighSurrogate(s.charCodeAt(end - 2)) ? 2 : 1;
-		if (units + w > budget) break;
-		units += w;
-		end -= w;
+/** B1: 1 Hz ticker that refreshes running-tool elapsed counters; runs only
+ * while a timed tool is active and stops itself afterwards. */
+let toolTicker: ReturnType<typeof setInterval> | null = null;
+function stopToolTicker(): void {
+	if (toolTicker) {
+		clearInterval(toolTicker);
+		toolTicker = null;
 	}
-	return marker + s.slice(end);
+}
+function ensureToolTicker(): void {
+	if (toolTicker) return;
+	toolTicker = setInterval(() => {
+		let running = false;
+		for (const e of toolsBy.values())
+			if (e.active && e.startedAt !== undefined) running = true;
+		if (!running) return stopToolTicker();
+		toolsVersionCounter++;
+		if (toolsOn) requestRender();
+	}, 1000);
+	toolTicker.unref?.();
 }
 
 function resultText(r: any): string {
@@ -650,7 +662,7 @@ function setToolOutput(e: ToolEntry, text: string): void {
  * branch reconstruction (resume / session_tree), so the bounded buffer,
  * the newest-first display and the MAX_TOOLS eviction (oldest shifted out)
  * behave identically for resumed and live entries. */
-function ingestToolCall(id: string, name: string, args: any): void {
+function ingestToolCall(id: string, name: string, args: any, startedAt?: number): void {
 	toolOrder.push(id);
 	toolsBy.set(id, {
 		id,
@@ -659,7 +671,9 @@ function ingestToolCall(id: string, name: string, args: any): void {
 		output: "",
 		active: true,
 		isError: false,
+		startedAt,
 	});
+	if (startedAt !== undefined) ensureToolTicker();
 	toolsVersionCounter++;
 	if (toolOrder.length > MAX_TOOLS) {
 		const evict = toolOrder.shift()!;
@@ -670,9 +684,10 @@ function ingestToolCall(id: string, name: string, args: any): void {
 /** SV-17: ingest one tool result, correlated to its call by id (live event
  * or resumed branch entry). A result whose call is not in the bounded buffer
  * (evicted or unknown) is ignored. */
-function ingestToolResult(id: string, result: any, isError: boolean): void {
+function ingestToolResult(id: string, result: any, isError: boolean, endedAt?: number): void {
 	const e = toolsBy.get(id);
 	if (!e) return;
+	if (endedAt !== undefined && e.startedAt !== undefined) e.endedAt = endedAt;
 	const text = resultText(result);
 	if (text) setToolOutput(e, text);
 	e.active = false;
@@ -702,7 +717,15 @@ function toolLines(theme: Theme, width: number): string[] {
 				? th.fg("error", e.name)
 				: th.fg("success", e.name);
 		const badge = e.subagent ? th.fg("muted", `[${e.agent ?? "sub"}]`) : "";
-		const prefix = `${mark} ${name}${badge}`;
+		// B1: duration (done) or live elapsed counter (running, from 1s on).
+		let dur = "";
+		if (e.startedAt !== undefined) {
+			if (e.endedAt !== undefined)
+				dur = th.fg("dim", ` ${formatDuration(e.endedAt - e.startedAt)}`);
+			else if (e.active && Date.now() - e.startedAt >= 1000)
+				dur = th.fg("warning", ` ${formatDuration(Date.now() - e.startedAt, true)}`);
+		}
+		const prefix = `${mark} ${name}${badge}${dur}`;
 		const room = textWidth - visibleWidth(prefix) - 1;
 		const args =
 			e.args && room >= 8
@@ -890,39 +913,232 @@ const panelsActive = () =>
 	thinkingOn || toolsOn || filesOn || trimResponse;
 const filesActive = () => isLayoutLayerActive("files") || !!REG.active;
 
+// ─── mouse: drag-resize, header buttons, wheel routing ───────────────────────
+
+/** Mouse wiring of one panel (thinking / tools band panel, or files dock). */
+interface PanelCtl {
+	id: PanelId;
+	/** Panel lives in the band (its bottom border drags the band height). */
+	inBand: boolean;
+	/** The panel's left edge column is a width-drag handle. */
+	resizeLeft: boolean;
+	/** Body ScrollView — wheel over the frame scrolls it (B3). */
+	scroll?: ScrollView;
+}
+
+/** Live layout entries that drags and resizes mutate in place — no tree
+ * rebuild, so panel scroll positions survive. Reset on every compose. */
+const geo: {
+	bandStack?: VStack;
+	band?: Component;
+	panelStack?: HStack;
+	thinkPanel?: Component;
+	toolsPanel?: Component;
+	dockStack?: HStack;
+	dockPanel?: Component;
+} = {};
+
+/** Terminal width the current geometry was computed for (resize hook). */
+let composedTermCols = -1;
+
+/** Late-bound UI access for mouse actions (set by the widget factory). */
+let themeGetter: (() => Theme) | null = null;
+let notifyFn: ((msg: string, level: "info" | "warning") => void) | null = null;
+
+function stackEntry(stack: unknown, component: Component | undefined): any {
+	if (!component) return undefined;
+	const entries = (stack as { entries?: any[] } | undefined)?.entries;
+	return entries?.find((e) => e.component === component);
+}
+
+/** Band width available next to the files dock. */
+function bandBase(cols: number): number {
+	const dockVisible = filesOn && cols >= MIN_TERM_WIDTH;
+	return cols - (dockVisible ? dockColsFor(cols) : 0);
+}
+
+/** Recompute dock width, band height and the thinking|tools split from the
+ * current state and mutate the composed entries in place. */
+function applyGeometry(): void {
+	const cols = tuiRef?.terminal?.columns ?? 120;
+	composedTermCols = cols;
+	const dockEntry = stackEntry(geo.dockStack, geo.dockPanel);
+	if (dockEntry) {
+		const w = dockColsFor(cols);
+		dockEntry.basis = w;
+		dockEntry.minSize = w;
+	}
+	const bandEntry = stackEntry(geo.bandStack, geo.band);
+	if (bandEntry) {
+		bandEntry.basis = bandHeight;
+		bandEntry.minSize = Math.min(6, bandHeight);
+	}
+	const t = stackEntry(geo.panelStack, geo.thinkPanel);
+	const u = stackEntry(geo.panelStack, geo.toolsPanel);
+	if (t && u) {
+		const base = bandBase(cols);
+		const toolsW = bandToolsColsFor(base);
+		t.basis = base - toolsW;
+		u.basis = toolsW;
+	}
+	requestRender();
+}
+
+type DragKind = "height" | "tools" | "dock";
+let drag: { kind: DragKind; x: number; y: number; start: number } | null = null;
+
+function beginDrag(kind: DragKind, ev: TuiMouseEvent): TuiMouseEventResult {
+	const cols = tuiRef?.terminal?.columns ?? 120;
+	const start =
+		kind === "height"
+			? bandHeight
+			: kind === "dock"
+				? dockColsFor(cols)
+				: bandToolsColsFor(bandBase(cols));
+	drag = { kind, x: ev.screenX, y: ev.screenY, start };
+	return { capture: true };
+}
+
+function continueDrag(ev: TuiMouseEvent): TuiMouseEventResult {
+	const d = drag;
+	if (!d || ev.type === "release") {
+		drag = null;
+		return { handled: true };
+	}
+	if (ev.type !== "drag") return { handled: true };
+	const cols = tuiRef?.terminal?.columns ?? 120;
+	if (d.kind === "height") {
+		// Never drag the band into its own auto-hide threshold (B2).
+		const rows = tuiRef?.terminal?.rows ?? 40;
+		const max = Math.max(6, Math.min(40, rows - 1 - MIN_ROWS_BELOW_BAND));
+		bandHeight = Math.max(6, Math.min(max, d.start + (ev.screenY - d.y)));
+	} else if (d.kind === "tools") {
+		const base = Math.max(1, bandBase(cols));
+		const w = d.start - (ev.screenX - d.x);
+		toolsWidthPct = Math.max(20, Math.min(60, Math.round((w * 100) / base)));
+	} else {
+		filesWidth = dockColsForManual(cols, d.start - (ev.screenX - d.x));
+	}
+	applyGeometry();
+	return { handled: true };
+}
+
+/** Header buttons occupy the 6 columns before the right corner, when the
+ * header has room (≥ 16 content columns). */
+const HEADER_BUTTONS_MIN = 16;
+function headerButtons(theme: Theme, id: PanelId): string {
+	return (
+		theme.fg("muted", `[${zoomed === id ? "↙" : "↗"}]`) + theme.fg("muted", "[×]")
+	);
+}
+function buttonAt(ev: TuiMouseEvent): "zoom" | "close" | null {
+	if (ev.y !== 0 || ev.width - 2 < HEADER_BUTTONS_MIN) return null;
+	const z = ev.width - 7;
+	if (ev.x >= z && ev.x < z + 3) return "zoom";
+	if (ev.x >= z + 3 && ev.x < z + 6) return "close";
+	return null;
+}
+
+function recompose(): void {
+	if (themeGetter) reconcileLayout(themeGetter());
+}
+
+function toggleZoom(id: PanelId): void {
+	zoomed = zoomed === id ? null : id;
+	recompose();
+}
+
+const PANEL_LABELS: Record<PanelId, [string, string]> = {
+	thinking: ["Thinking", "/split-thinking"],
+	tools: ["Tools", "/split-tools"],
+	files: ["Files", "/files"],
+};
+
+function hidePanel(id: PanelId): void {
+	if (id === "thinking") thinkingOn = false;
+	else if (id === "tools") toolsOn = false;
+	else filesOn = false;
+	if (zoomed === id) zoomed = null;
+	recompose();
+	const [label, cmd] = PANEL_LABELS[id];
+	notifyFn?.(`${label} hidden · ${cmd} to show`, "info");
+}
+
+/** Shared mouse handling for panel chrome: header buttons (top), band-height
+ * drag (band bottom border), width drag (left edge), wheel routing. */
+function panelMouse(
+	ev: TuiMouseEvent,
+	ctl: PanelCtl | undefined,
+	where: "top" | "bottom" | "body",
+): TuiMouseEventResult | undefined {
+	if (drag && (ev.type === "drag" || ev.type === "release")) return continueDrag(ev);
+	if (!ctl) return undefined;
+	if (ev.type === "wheel") {
+		// Body wheel uses native routing (contained in the panel's ScrollView).
+		if (where === "body" || !ctl.scroll) return undefined;
+		ctl.scroll.scrollBy(ev.wheelDelta ?? 0);
+		return { handled: true };
+	}
+	if (ev.button !== "left") return undefined;
+	if (ev.type === "press") {
+		if (where === "top" && buttonAt(ev)) return { capture: true };
+		if (ctl.resizeLeft && ev.x === 0)
+			return beginDrag(ctl.id === "files" ? "dock" : "tools", ev);
+		if (where === "bottom" && ctl.inBand) return beginDrag("height", ev);
+		return undefined;
+	}
+	if (ev.type === "click" && where === "top") {
+		const b = buttonAt(ev);
+		if (b === "zoom") toggleZoom(ctl.id);
+		else if (b === "close") hidePanel(ctl.id);
+		if (b) return { handled: true };
+	}
+	return undefined;
+}
+
 // ─── framed panel components ─────────────────────────────────────────────────
 
-class BorderTop {
+class BorderTop implements Component {
 	constructor(
 		private theme: Theme,
 		private title: string,
 		private color: "accent" | "muted",
 		private streaming: () => boolean,
+		private ctl?: PanelCtl,
 	) {}
 	render(width: number): string[] {
 		const th = this.theme;
 		const contentWidth = Math.max(1, width - 2);
+		const buttons =
+			this.ctl && contentWidth >= HEADER_BUTTONS_MIN ? headerButtons(th, this.ctl.id) : "";
+		const room = contentWidth - visibleWidth(buttons);
 		const title = th.fg(this.color, ` ${this.title} `);
 		const dot = this.streaming() ? th.fg("warning", "●") : "";
-		const label = truncateToWidth(title + dot, contentWidth);
-		const fill = th.fg(
-			"border",
-			"─".repeat(Math.max(0, contentWidth - visibleWidth(label))),
-		);
-		return [th.fg("border", "╭") + label + fill + th.fg("border", "╮")];
+		const label = truncateToWidth(title + dot, room);
+		const fill = th.fg("border", "─".repeat(Math.max(0, room - visibleWidth(label))));
+		return [th.fg("border", "╭") + label + fill + buttons + th.fg("border", "╮")];
+	}
+	handleMouse(ev: TuiMouseEvent): TuiMouseEventResult | undefined {
+		return panelMouse(ev, this.ctl, "top");
 	}
 	invalidate(): void {}
 	dispose(): void {}
 }
 
-class BorderBottom {
-	constructor(private theme: Theme) {}
+class BorderBottom implements Component {
+	constructor(
+		private theme: Theme,
+		private ctl?: PanelCtl,
+	) {}
 	render(width: number): string[] {
 		return [
 			this.theme.fg("border", "╰") +
 				this.theme.fg("border", "─".repeat(Math.max(0, width - 2))) +
 				this.theme.fg("border", "╯"),
 		];
+	}
+	handleMouse(ev: TuiMouseEvent): TuiMouseEventResult | undefined {
+		return panelMouse(ev, this.ctl, "bottom");
 	}
 	invalidate(): void {}
 	dispose(): void {}
@@ -944,18 +1160,21 @@ class MeasurementSafeVStack extends VStack {
 
 /**
  * OracleSpec body: renders the recent window with a left │ edge only — the
- * ScrollView's always-on scrollbar column is the right frame edge (track
- * styled as border, so the frame reads as complete; thumb slides when
- * overflowing). Pads every row to EXACT width and always emits at least
- * `minRows` rows so the left edge is continuous when content is short. No
- * per-line memo: the window is small, a (version, width) cache suffices.
+ * ScrollView's always-on scrollbar column is the right frame edge. Pads every
+ * row to EXACT width and always emits at least `minRows` rows so the left
+ * edge is continuous when content is short. Output is cached on
+ * (version, minRows, width); wrapped rows are memoized per source line, so a
+ * streaming flush only re-wraps lines that changed (the tail).
  */
-class RecentBody {
+class RecentBody implements Component {
 	private cacheVersion = -1;
-	/** SV-19: bounded width cache — keep the current width plus a small LRU of
-	 * recent widths so resize cycling cannot grow it unbounded. */
+	private cacheMinRows = -1;
+	/** SV-19: bounded width cache (current width + small LRU). */
 	private cacheByWidth = new Map<number, string[]>();
 	private static readonly MAX_CACHED_WIDTHS = 4;
+	/** Per-line wrap memo for one width; holds only the lines last shown. */
+	private wrapWidth = -1;
+	private wrapMemo = new Map<string, string[]>();
 	constructor(
 		private theme: Theme,
 		private style: (line: string) => string,
@@ -964,46 +1183,50 @@ class RecentBody {
 		private empty: string,
 		/** Rows to guarantee so the left edge has no gaps (viewport height). */
 		private minRows: () => number,
+		private ctl?: PanelCtl,
 	) {}
 	render(width: number): string[] {
 		const th = this.theme;
 		const v = this.version();
-		if (v !== this.cacheVersion) {
+		const min = Math.max(1, this.minRows());
+		if (v !== this.cacheVersion || min !== this.cacheMinRows) {
 			this.cacheVersion = v;
+			this.cacheMinRows = min;
 			this.cacheByWidth.clear();
 		}
 		const cached = this.cacheByWidth.get(width);
 		if (cached) {
-			// SV-19: refresh recency so eviction is genuinely LRU, not FIFO —
-			// delete+set moves this width to the Map's newest position.
+			// SV-19: refresh recency so eviction is genuinely LRU.
 			this.cacheByWidth.delete(width);
 			this.cacheByWidth.set(width, cached);
 			return cached;
 		}
+		if (width !== this.wrapWidth) {
+			this.wrapWidth = width;
+			this.wrapMemo.clear();
+		}
+		const memo = this.wrapMemo;
+		const nextMemo = new Map<string, string[]>();
 		const edge = th.fg("border", "│");
-		const pad = (s: string) =>
-			" ".repeat(Math.max(0, width - 1 - visibleWidth(s)));
-		// Wrap newest-first, keep only the newest MAX_BODY_ROWS visual rows;
-		// giant logical lines are suffix-capped before wrapping.
+		const pad = (s: string) => " ".repeat(Math.max(0, width - 1 - visibleWidth(s)));
+		// Wrap newest-first, keep only the newest MAX_BODY_ROWS visual rows.
 		// SV-03/SV-04: fragments of ONE source line are wrapped as a group and
-		// the group is inserted in order (an individual unshift reversed the
-		// fragments of one line); the MAX_BODY_ROWS cap counts VISUAL rows, not
-		// source lines, so one long line cannot blow past the cap at narrow
-		// widths. A group that would straddle the cap is skipped whole (no
-		// fragment is ever split); the newest groups always fit. A single group
-		// larger than the whole cap keeps only its newest fragments.
+		// inserted in order; the cap counts VISUAL rows. A group that would
+		// straddle the cap is skipped whole; a single group larger than the
+		// whole cap keeps only its newest fragments.
 		const src = this.lines(width);
 		const groups: string[][] = [];
 		let used = 0;
 		for (let i = src.length - 1; i >= 0; i--) {
-			const line =
-				src[i].length > MAX_LINE_CHARS
-					? "… " + src[i].slice(-MAX_LINE_CHARS + 1)
-					: src[i];
-			const frags = wrapTextWithAnsi(
-				this.style(line),
-				Math.max(1, width - 3),
-			).map((w: string) => " " + w);
+			const raw = src[i];
+			let frags = nextMemo.get(raw) ?? memo.get(raw);
+			if (!frags) {
+				frags = wrapTextWithAnsi(
+					this.style(capDisplayLine(raw, MAX_LINE_CHARS)),
+					Math.max(1, width - 3),
+				).map((w: string) => " " + w);
+			}
+			nextMemo.set(raw, frags);
 			if (used + frags.length > MAX_BODY_ROWS) {
 				if (groups.length === 0 && frags.length > MAX_BODY_ROWS)
 					groups.push(frags.slice(frags.length - MAX_BODY_ROWS));
@@ -1012,9 +1235,9 @@ class RecentBody {
 			groups.push(frags);
 			used += frags.length;
 		}
+		this.wrapMemo = nextMemo;
 		const rows: string[] = [];
-		for (let g = groups.length - 1; g >= 0; g--)
-			for (const f of groups[g]) rows.push(f);
+		for (let g = groups.length - 1; g >= 0; g--) for (const f of groups[g]) rows.push(f);
 		let out: string[];
 		if (rows.length === 0) {
 			const empty = " " + th.fg("dim", this.empty);
@@ -1022,23 +1245,22 @@ class RecentBody {
 		} else {
 			out = rows.map((r) => edge + r + pad(r));
 		}
-		// Guarantee a continuous left edge: fill short content up to minRows.
-		const min = Math.max(1, this.minRows());
 		const filler = edge + " ".repeat(Math.max(0, width - 1));
 		while (out.length < min) out.push(filler);
 		this.cacheByWidth.set(width, out);
-		// SV-19: bound the number of cached widths (Map preserves insertion
-		// order; hits refresh recency above, so the first key is least-recent
-		// and eviction is true LRU).
 		while (this.cacheByWidth.size > RecentBody.MAX_CACHED_WIDTHS) {
 			const oldest = this.cacheByWidth.keys().next().value as number;
 			this.cacheByWidth.delete(oldest);
 		}
 		return out;
 	}
+	handleMouse(ev: TuiMouseEvent): TuiMouseEventResult | undefined {
+		return panelMouse(ev, this.ctl, "body");
+	}
 	invalidate(): void {
 		this.cacheVersion = -1;
 		this.cacheByWidth.clear();
+		this.wrapMemo.clear();
 	}
 	dispose(): void {}
 }
@@ -1053,7 +1275,13 @@ class FilesPanel {
 		private theme: Theme,
 		/** Fullscreen dock: live terminal rows. Overlay: undefined. */
 		private heightProvider?: () => number,
+		/** Mouse wiring (dock / zoom only; the regular-mode overlay has none). */
+		private ctl?: PanelCtl,
 	) {}
+
+	handleMouse(ev: TuiMouseEvent): TuiMouseEventResult | undefined {
+		return panelMouse(ev, this.ctl, ev.y === 0 ? "top" : "body");
+	}
 
 	// No handleInput: the regular-mode overlay is nonCapturing, so it never
 	// receives keys — Escape belongs to the editor/Pi, and /files is the
@@ -1176,7 +1404,11 @@ class FilesPanel {
 		}
 
 		const out = [
-			th.fg("border", `╭${"─".repeat(inner)}╮`),
+			this.ctl && inner >= HEADER_BUTTONS_MIN
+				? th.fg("border", `╭${"─".repeat(inner - 6)}`) +
+					headerButtons(th, this.ctl.id) +
+					th.fg("border", "╮")
+				: th.fg("border", `╭${"─".repeat(inner)}╮`),
 			row(` ${th.fg("accent", `📂 Files (${entries.length})`)}`),
 			th.fg("border", `├${"─".repeat(inner)}┤`),
 			...body,
@@ -1196,6 +1428,38 @@ class FilesPanel {
 
 // ─── layout composition (one layer) ──────────────────────────────────────────
 
+interface BandDef {
+	title: string;
+	color: "accent" | "muted";
+	streaming: () => boolean;
+	style: (line: string) => string;
+	lines: (width: number) => string[];
+	version: () => number;
+	empty: string;
+}
+
+function bandDef(theme: Theme, id: "thinking" | "tools"): BandDef {
+	return id === "thinking"
+		? {
+				title: "Thinking",
+				color: "accent",
+				streaming: () => thinking.streaming,
+				style: (l) => theme.fg("thinkingText", l),
+				lines: (w) => thinkingLines(theme, w),
+				version: () => thinking.version,
+				empty: "Thinking idle",
+			}
+		: {
+				title: "Tool Usage",
+				color: "muted",
+				streaming: () => toolOrder.some((id) => toolsBy.get(id)?.active),
+				style: (l) => l,
+				lines: (w) => toolLines(theme, w),
+				version: toolsVersion,
+				empty: "No tools called yet",
+			};
+}
+
 /**
  * Panel scaffold: no separate border columns, no inner HStack — the always-on
  * scrollbar column is the right frame edge (track styled as border; the idle
@@ -1204,193 +1468,110 @@ class FilesPanel {
  * second composite layer. The MeasurementSafeVStack wrapper keeps the
  * engine's discarded measurement passes O(1).
  */
-function framedPanel(
-	theme: Theme,
-	top: Component,
-	body: RecentBody,
-): Component {
+function framedPanel(theme: Theme, d: BandDef, ctl: PanelCtl): Component {
+	// Filler rows track the real viewport (band or zoomed), so the left edge
+	// stays continuous at any allocated height.
+	const body = new RecentBody(
+		theme,
+		d.style,
+		d.lines,
+		d.version,
+		d.empty,
+		() => ctl.scroll?.viewportHeight || bandHeight - 2,
+		ctl,
+	);
 	const scroll = new ScrollView(body, {
 		follow: "end",
 		overscroll: "contain",
 		scrollbar: "always",
 		scrollbarTrackStyle: (t: string) => theme.fg("border", t),
-		// SV-25: the layout engine paints the idle thumb as "┃" (heavy) while
-		// the track is "│" (light) — same border color, different glyph, so the
-		// right frame edge read as broken at the thumb's rows. Map the IDLE
-		// thumb to the track's glyph so the edge is a uniform │ column at rest;
-		// the ACTIVE thumb keeps "█" in accent for scroll feedback. No second
-		// edge column, no track/color change, design unchanged.
+		// SV-25: map the IDLE thumb "┃" to the track's "│" so the right frame
+		// edge is uniform at rest; the ACTIVE thumb keeps "█" in accent.
 		scrollbarThumbStyle: (t: string) =>
 			theme.fg(t === "█" ? "accent" : "border", t === "┃" ? "│" : t),
 	});
+	ctl.scroll = scroll;
 	return new MeasurementSafeVStack([
-		{ component: top, basis: 1, grow: 0, shrink: 0 },
+		{ component: new BorderTop(theme, d.title, d.color, d.streaming, ctl), basis: 1, grow: 0, shrink: 0 },
 		{ component: scroll, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-		{ component: new BorderBottom(theme), basis: 1, grow: 0, shrink: 0 },
+		{ component: new BorderBottom(theme, ctl), basis: 1, grow: 0, shrink: 0 },
 	]);
+}
+
+/** Top border of the transcript region under the band; drags the band height. */
+class BandSeparator implements Component {
+	constructor(private theme: Theme) {}
+	render(w: number): string[] {
+		const th = this.theme;
+		return [th.fg("border", "╭") + th.fg("border", "─".repeat(Math.max(0, w - 2))) + th.fg("border", "╮")];
+	}
+	handleMouse(ev: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (drag && (ev.type === "drag" || ev.type === "release")) return continueDrag(ev);
+		if (ev.type === "press" && ev.button === "left") return beginDrag("height", ev);
+		return undefined;
+	}
+	invalidate(): void {}
+	dispose(): void {}
 }
 
 function buildBand(theme: Theme, inner: Component): Component {
-	const panels: { component: Component; basis: number; grow: number }[] = [];
-	const minRows = () => Math.max(1, bandHeight - 2);
-
-	const defs: {
-		title: string;
-		color: "accent" | "muted";
-		streaming: () => boolean;
-		style: (line: string) => string;
-		lines: (width: number) => string[];
-		version: () => number;
-		empty: string;
-	}[] = [];
-	if (thinkingOn)
-		defs.push({
-			title: "Thinking",
-			color: "accent",
-			streaming: () => thinking.streaming,
-			style: (l) => theme.fg("thinkingText", l),
-			lines: (w) => thinkingLines(theme, w),
-			version: () => thinking.version,
-			empty: "Thinking idle",
-		});
-	if (toolsOn)
-		defs.push({
-			title: "Tool Usage",
-			color: "muted",
-			streaming: () => toolOrder.some((id) => toolsBy.get(id)?.active),
-			style: (l) => l,
-			lines: (w) => toolLines(theme, w),
-			version: toolsVersion,
-			empty: "No tools called yet",
-		});
-
-	// F/F2: explicit tunable width split — no equal-flex weights or engine
-	// content measurement. toolsWidthPct % of the ALLOCATED band width goes
-	// to the tools panel, thinking gets the rest (minimum clamps inside the
-	// helper). F2: the base is the allocated band region — with the files dock
-	// visible (filesOn, ≥ MIN_TERM_WIDTH) that is the terminal width minus the
-	// dock columns (the SV-07 clamp), not the full terminal width.
-	// Single-panel bands keep the full width (no ratio involved).
-	const termCols = tuiRef?.terminal?.columns ?? 120;
-	const dockVisible = filesOn && termCols >= MIN_TERM_WIDTH;
-	const base = termCols - (dockVisible ? dockColsFor(termCols) : 0);
-	const splitBand = defs.length === 2;
-	const toolsW = splitBand ? bandToolsColsFor(base) : -1;
-	const thinkW = base - toolsW;
-	composedBandTermCols = termCols;
-
-	let di = 0;
-	for (const d of defs) {
-		const top = new BorderTop(theme, d.title, d.color, d.streaming);
-		// defs order: thinking first (when on), then tools.
-		const w = splitBand ? (di === 0 ? thinkW : toolsW) : 1;
-		panels.push({
-			component: framedPanel(
-				theme,
-				top,
-				new RecentBody(theme, d.style, d.lines, d.version, d.empty, minRows),
-			),
-			basis: w,
-			grow: splitBand ? 0 : 1,
-		});
-		di++;
-	}
-
+	const ids: ("thinking" | "tools")[] = [];
+	if (thinkingOn) ids.push("thinking");
+	if (toolsOn) ids.push("tools");
 	// No enabled sub-panels → no band at all.
-	if (panels.length === 0) return inner;
+	if (ids.length === 0) return inner;
 
-	// A single panel needs no HStack wrapper at all.
-	const band =
-		panels.length === 1
-			? panels[0]!.component
-			: new HStack(panels.map((p) => ({ ...p, shrink: 1, minSize: 1 })));
-	const sep = new (class implements Component {
-		invalidate(): void {}
-		dispose(): void {}
-		render(w: number): string[] {
-			return [
-				theme.fg("border", "╭") +
-					theme.fg("border", "─".repeat(Math.max(0, w - 2))) +
-					theme.fg("border", "╮"),
-			];
-		}
-	})();
-	return new VStack([
-		{
-			component: band,
-			basis: bandHeight,
-			grow: 0,
-			shrink: 1,
-			minSize: Math.min(6, bandHeight),
-		},
-		{ component: sep, basis: 1, grow: 0, shrink: 0 },
+	// F/F2: explicit tunable width split (toolsWidthPct of the band base, i.e.
+	// the terminal minus a visible files dock). Single panels take the full
+	// width. applyGeometry() sets the bases and re-applies them on drags and
+	// resizes without rebuilding the tree.
+	const splitBand = ids.length === 2;
+	const panels = ids.map((id) =>
+		framedPanel(theme, bandDef(theme, id), {
+			id,
+			inBand: true,
+			// The boundary between the panels is the tools panel's left edge.
+			resizeLeft: splitBand && id === "tools",
+		}),
+	);
+	const band = splitBand
+		? new HStack(panels.map((component) => ({ component, basis: 1, grow: 0, shrink: 1, minSize: 1 })))
+		: panels[0]!;
+	if (splitBand) {
+		geo.panelStack = band as HStack;
+		geo.thinkPanel = panels[0];
+		geo.toolsPanel = panels[1];
+	}
+	// B2: on short terminals hide the band instead of squeezing the transcript.
+	const fits = (v: { height: number }) => v.height - bandHeight - 1 >= MIN_ROWS_BELOW_BAND;
+	const stack = new VStack([
+		{ component: band, basis: bandHeight, grow: 0, shrink: 1, minSize: Math.min(6, bandHeight), visible: fits },
+		{ component: new BandSeparator(theme), basis: 1, grow: 0, shrink: 0, visible: fits },
 		{ component: inner, basis: 0, grow: 1, shrink: 1, minSize: 1 },
 	]);
-}
-
-/** Dock width (clamped, 34–48) that the current composition was built with.
- *  SV-07: the dock basis is captured at compose time; the widget render
- *  compares it against the live terminal width and recomposes on change. */
-let composedDockCols = -1;
-
-/** F: explicit band split — minimum panel widths (cols) below which the
- * toolsWidthPct ratio clamps, so neither panel degenerates at narrow
- * terminals. */
-const MIN_THINK_COLS = 24;
-const MIN_TOOLS_COLS = 20;
-
-/** F: tools panel width (cols) for the given terminal width under the
- * current toolsWidthPct, with the minimum clamps. When both minimums
- * cannot hold (very narrow terminals) the raw ratio is used — the panels
- * share whatever is available. */
-function bandToolsColsFor(total: number): number {
-	const raw = Math.round((total * toolsWidthPct) / 100);
-	let toolsW = raw;
-	let thinkW = total - toolsW;
-	if (toolsW < MIN_TOOLS_COLS) {
-		toolsW = MIN_TOOLS_COLS;
-		thinkW = total - toolsW;
-	}
-	if (thinkW < MIN_THINK_COLS) {
-		thinkW = MIN_THINK_COLS;
-		toolsW = total - thinkW;
-	}
-	if (toolsW < MIN_TOOLS_COLS) {
-		toolsW = raw;
-		thinkW = total - toolsW;
-	}
-	return toolsW;
-}
-
-/** TERMINAL width the current band composition was built with. F2: the
- * widget render recomposes on any terminal-width change, so a resize never
- * leaves a stale basis — even when the tools cols round to the same value
- * (e.g. 101→102 cols at 50%). */
-let composedBandTermCols = -1;
-
-/** F2: the files dock's clamped width (SV-07) for a terminal width — shared
- * by buildFilesDock and buildBand so the band split uses the SAME allocated
- * base the dock actually takes. */
-function dockColsFor(cols: number): number {
-	return Math.max(34, Math.min(48, Math.floor(cols * 0.25)));
+	geo.bandStack = stack;
+	geo.band = band;
+	return stack;
 }
 
 function buildFilesDock(theme: Theme, inner: Component): Component {
 	const cols = tuiRef?.terminal?.columns ?? 120;
 	const panelCols = dockColsFor(cols);
-	composedDockCols = panelCols;
-	const panel = new FilesPanel(theme, () => tuiRef?.terminal?.rows ?? 0);
-	// Wrap the left subtree in a MeasurementSafeVStack — the dock
-	// HStack's discarded intrinsic-height measurement would otherwise eagerly
-	// render the ENTIRE left side (band + transcript) every keystroke frame.
-	// ENTRY FORM MATTERS: a bare component defaults to grow:0, and this
-	// wrapper's sentinel render measures as 1 row — with grow:0 a SHORTER-
-	// than-screen left subtree (e.g. trim mode's response doc) would collapse
-	// to its intrinsic height instead of stretching, blanking the left side.
+	const panel = new FilesPanel(theme, () => tuiRef?.terminal?.rows ?? 0, {
+		id: "files",
+		inBand: false,
+		resizeLeft: true,
+	});
+	// Wrap the left subtree in a MeasurementSafeVStack — the dock HStack's
+	// discarded intrinsic-height measurement would otherwise eagerly render the
+	// ENTIRE left side (band + transcript) every keystroke frame. ENTRY FORM
+	// MATTERS: a bare component defaults to grow:0, and this wrapper's sentinel
+	// render measures as 1 row — a shorter-than-screen left subtree would then
+	// collapse to its intrinsic height instead of stretching.
 	const left = new MeasurementSafeVStack([
 		{ component: inner, basis: 0, grow: 1, shrink: 1, minSize: 1 },
 	]);
-	return new HStack([
+	const stack = new HStack([
 		{ component: left, basis: 0, grow: 1, shrink: 1, minSize: 1 },
 		{
 			component: panel,
@@ -1400,6 +1581,43 @@ function buildFilesDock(theme: Theme, inner: Component): Component {
 			minSize: panelCols,
 			visible: (v: { width: number }) => v.width >= MIN_TERM_WIDTH,
 		},
+	]);
+	geo.dockStack = stack;
+	geo.dockPanel = panel;
+	return stack;
+}
+
+/** Whether a zoomable panel is currently enabled (and composable). */
+function panelOn(id: PanelId): boolean {
+	if (id === "thinking") return thinkingOn;
+	if (id === "tools") return toolsOn;
+	return filesOn && typeof tuiRef?.setLayoutRoot === "function";
+}
+
+/** D1: one panel over the whole area above pi's editor dock (reused verbatim,
+ * like trim mode); the transcript is hidden until the zoom is restored. */
+function buildZoom(theme: Theme, id: PanelId): Component | null {
+	const base = getBaseRoot();
+	const dock = base ? baseDockOf(base) : null;
+	if (!dock) return null;
+	const ctl: PanelCtl = { id, inBand: false, resizeLeft: false };
+	const panel =
+		id === "files"
+			? new FilesPanel(
+					theme,
+					// The panel sizes itself: terminal rows minus the dock's height.
+					() =>
+						Math.max(
+							8,
+							(tuiRef?.terminal?.rows ?? 24) -
+								dock.render(tuiRef?.terminal?.columns ?? 80).length,
+						),
+					ctl,
+				)
+			: framedPanel(theme, bandDef(theme, id), ctl);
+	return new VStack([
+		{ component: panel, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+		{ component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
 	]);
 }
 
@@ -1434,6 +1652,10 @@ function buildTrimInner(theme: Theme): Component | null {
 	if (!responseScrollView) {
 		responseScrollView = new ScrollView(responseDoc, {
 			follow: "end",
+			// A1: in trim mode pi's own transcript (primary) is not mounted;
+			// without this the FIRST laid-out ScrollView — the Thinking panel —
+			// became primary and received PgUp/PgDn, Ctrl+F and wheel fallback.
+			primary: true,
 			overscroll: "chain",
 			scrollbar: "auto",
 			scrollbarTrackStyle: (t: string) => theme.fg("dim", t),
@@ -1448,6 +1670,13 @@ function buildTrimInner(theme: Theme): Component | null {
 
 /** Build the full composed layout root based on enabled panels. */
 function composeLayout(theme: Theme, inner: Component): Component {
+	// Geometry refs belong to the tree being built; drop stale ones first.
+	for (const k of Object.keys(geo) as (keyof typeof geo)[]) delete geo[k];
+	composedTermCols = tuiRef?.terminal?.columns ?? 120;
+	if (zoomed && panelOn(zoomed)) {
+		const z = buildZoom(theme, zoomed);
+		if (z) return z;
+	}
 	// Trim mode swaps pi's transcript for the response doc; the base root's
 	// dock (editor/footer) is preserved inside the swapped inner.
 	let root = inner;
@@ -1459,11 +1688,16 @@ function composeLayout(theme: Theme, inner: Component): Component {
 	if (wantBand) root = buildBand(theme, root);
 	if (filesOn && tuiRef && typeof tuiRef.setLayoutRoot === "function")
 		root = buildFilesDock(theme, root);
+	// Set the real bases (dock width, band height, width split) on the
+	// freshly built entries.
+	applyGeometry();
 	return root;
 }
 
 /** Reconcile the single "ui" layout layer with the current panel flags. */
 function reconcileLayout(theme: Theme): void {
+	drag = null;
+	if (zoomed && !panelOn(zoomed)) zoomed = null;
 	const wantAny = thinkingOn || toolsOn || filesOn || trimResponse;
 	if (!wantAny || !tuiRef || typeof tuiRef.setLayoutRoot !== "function") {
 		if (isLayoutLayerActive("ui")) setLayoutLayer("ui", null);
@@ -1491,6 +1725,8 @@ export default function (pi: ExtensionAPI) {
 			(tui, theme) => {
 				tuiRef = tui;
 				docTheme = theme;
+				themeGetter = () => ctx.ui.theme;
+				notifyFn = (msg, level) => ctx.ui.notify(msg, level);
 				initLayoutManager(tui);
 				// SV-14: apply the still-pending startup composition here. The
 				// factory runs synchronously during session_start (before the
@@ -1519,34 +1755,15 @@ export default function (pi: ExtensionAPI) {
 								reconcileLayout(liveTheme);
 							}
 						}
-						// SV-07: the dock basis is captured at compose time, so a resize
-						// used to leave the width frozen. Compare the clamped width the
-						// composition would use now and recompose on change; the 34–48
-						// clamp and the <90 hide rule are preserved (hide/show stays
-						// dynamic via the entry's visible callback).
+						// SV-07/F2: dock width and the band's width split derive from the
+						// terminal width; on any resize re-apply them to the composed
+						// entries in place (no rebuild, scroll positions survive).
 						if (
-							filesOn &&
 							typeof tuiRef?.setLayoutRoot === "function" &&
-							isLayoutLayerActive("ui")
-						) {
-							const cols = tuiRef?.terminal?.columns ?? 120;
-							const want = dockColsFor(cols);
-							if (want !== composedDockCols)
-								reconcileLayout(ctx.ui.theme);
-						}
-						// F2: same recompose hook for the band's explicit width split,
-						// keyed on the TERMINAL width — any resize recomposes, even
-						// when the tools cols round to the same value (101→102 at 50%).
-						if (
-							thinkingOn &&
-							toolsOn &&
-							typeof tuiRef?.setLayoutRoot === "function" &&
-							isLayoutLayerActive("ui")
-						) {
-							const cols = tuiRef?.terminal?.columns ?? 120;
-							if (cols !== composedBandTermCols)
-								reconcileLayout(ctx.ui.theme);
-						}
+							isLayoutLayerActive("ui") &&
+							(tuiRef?.terminal?.columns ?? 120) !== composedTermCols
+						)
+							applyGeometry();
 						return widgetLines(liveTheme, width);
 					},
 					invalidate: () => {},
@@ -1639,6 +1856,8 @@ export default function (pi: ExtensionAPI) {
 		toolMode = cfg.toolMode;
 		bandHeight = cfg.bandHeight;
 		toolsWidthPct = cfg.toolsWidthPct;
+		filesWidth = cfg.filesWidth;
+		zoomed = null;
 		filesOn = cfg.files;
 		showDiff = cfg.diff;
 		answerDividerMode = cfg.answerDivider;
@@ -1709,7 +1928,7 @@ export default function (pi: ExtensionAPI) {
 	// Tool stream.
 	pi.on("tool_execution_start", (event) => {
 		// SV-17: same ingest path the branch rebuild uses.
-		ingestToolCall(event.toolCallId, event.toolName, event.args);
+		ingestToolCall(event.toolCallId, event.toolName, event.args, Date.now());
 		if (anyPanelActive()) requestRender();
 	});
 	pi.on("tool_execution_update", (event) => {
@@ -1722,7 +1941,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("tool_execution_end", (event) => {
 		// SV-17: same ingest path the branch rebuild uses.
-		ingestToolResult(event.toolCallId, (event as any).result, event.isError);
+		ingestToolResult(event.toolCallId, (event as any).result, event.isError, Date.now());
 		if (anyPanelActive()) requestRender();
 	});
 
@@ -1841,6 +2060,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (_e, ctx) => {
+		stopToolTicker();
+		drag = null;
 		if (startupTimer) {
 			clearTimeout(startupTimer);
 			startupTimer = null;
@@ -1971,6 +2192,7 @@ export default function (pi: ExtensionAPI) {
 				toolsOn = false;
 				filesOn = false;
 				trimResponse = false;
+				zoomed = null;
 				reconcileLayout(ctx.ui.theme);
 				ctx.ui.notify("Split view off (all panels) · /split-save saves defaults", "info");
 			} else {
@@ -2163,6 +2385,7 @@ export default function (pi: ExtensionAPI) {
 				trimResponse,
 				bandHeight,
 				toolsWidthPct,
+				...(filesWidth === null ? {} : { filesWidth }),
 				diff: showDiff,
 				answerDivider: answerDividerMode,
 			});

@@ -10,5 +10,5 @@
 		"skipLibCheck": true,
 		"noEmit": true
 	},
-	"files": ["split-view.ts", "layout-manager.ts", "ui-panels-config.ts"]
+	"files": ["split-view.ts", "layout-manager.ts", "ui-panels-config.ts", "helpers.ts", "test/helpers.test.ts"]
 }

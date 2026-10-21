@@ -25,8 +25,9 @@ transcript mode — composed as one clean layout layer over pi's native transcri
 
 - **Thinking panel** — live reasoning stream (coalesced flushes, bounded buffers), newest
   window with full history left in the transcript.
-- **Tool Usage panel** — every tool call with status/output preview, compact or full detail;
-  history is rebuilt from the session branch on resume/branch switch.
+- **Tool Usage panel** — every tool call with status/output preview, compact or full detail,
+  and its duration (a live elapsed counter while it runs); history is rebuilt from the
+  session branch on resume/branch switch.
 - **Files panel** — right dock in fullscreen (or a passive overlay in regular mode) listing
   read/written/seen files newest-first, with a live edit-diff subpanel (hide the subpanel
   with `/split-diff` and keep just the list); a compact status widget below the editor.
@@ -37,8 +38,23 @@ transcript mode — composed as one clean layout layer over pi's native transcri
 - **Measurement-safe composition** — one layout layer owns the whole frame; discarded
   intrinsic-measure passes are O(1); panels cache on (version, width) with LRU bounding;
   theme changes recompose; startup composes before the first paint.
-- Resize-aware geometry, display-column-correct truncation everywhere (CJK/emoji safe),
-  bounded storage caps, and honest per-command feedback.
+- Resize-aware geometry (the band hides itself on terminals too short for it),
+  display-column-correct truncation everywhere (CJK/emoji safe), bounded storage caps,
+  and honest per-command feedback.
+
+## Mouse
+
+| Where | Action |
+| --- | --- |
+| `[↗]` / `[↙]` in a panel header | expand the panel over the whole area above the editor / restore |
+| `[×]` in a panel header | hide the panel (its command brings it back) |
+| band's bottom border, or the line under the band | drag to change the band height |
+| left edge of the Tool Usage panel | drag to change the thinking ↔ tools split |
+| left edge of the files dock | drag to change the dock width |
+| wheel over a panel (frame included) | scroll that panel |
+
+Drag-resizes behave like the matching commands: they last for the current window, and
+`/split-save` stores them.
 
 ## Commands
 
@@ -63,8 +79,8 @@ Toggles are session-local by default (concurrent windows don't clobber each othe
 
 Tweaks you make with the toggle commands last for the current window only. When the layout
 looks right, run **`/split-save`** to store it as the startup defaults for *new* windows
-(which panels are on, band height, tools width, tool detail mode, the diff subpanel
-and the answer divider). `/split` then toggles between bare pi and that saved layout.
+(which panels are on, band height, tools width, files dock width, tool detail mode,
+the diff subpanel and the answer divider). `/split` then toggles between bare pi and that saved layout.
 
 The band and the dock need pi's fullscreen mode
 (`"tuiMode": "fullscreen"` in settings); the files panel falls back to an overlay in
@@ -94,11 +110,15 @@ pi --tui-mode fullscreen -e /path/to/split-view.ts
 
 Requires the `pi` coding agent (full screen TUI mode recommended).
 
+Not compatible with other extensions that replace pi's fullscreen layout root
+(e.g. pi-stereo-view): only one of them can own the layout.
+
 ## Development
 
 ```sh
 npm install
 npm run typecheck   # tsc --noEmit, checked against pi 1.2.0
+npm test            # node:test unit tests for the pure helpers
 ```
 
 ## Changelog
@@ -109,6 +129,7 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 - `split-view.ts` — the whole extension: panels, buffers, commands, composition
 - `layout-manager.ts` — shared single-layer layout ownership around pi's base root
+- `helpers.ts` — pure helpers (truncation, caps, geometry, durations, stream tail)
 - `ui-panels-config.ts` — validated startup-default config (`~/.pi/agent/ui-panels.json`)
 
 ## License

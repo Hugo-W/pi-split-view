@@ -42,6 +42,9 @@ export interface UiPanelsConfig {
 	bandHeight?: number;
 	/** Tools panel's share of the band width in percent (20–60, default 35). */
 	toolsWidthPct?: number;
+	/** Files dock width in columns (set by dragging its edge). Absent = auto
+	 * (25% of the terminal, 34–48 cols). */
+	filesWidth?: number;
 }
 
 /** SV-12: strict boolean read — only real booleans count; absent or
@@ -64,6 +67,7 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 	trimResponse: boolean;
 	bandHeight: number;
 	toolsWidthPct: number;
+	filesWidth: number | null;
 }> {
 	// SV-12: tolerate any shape — a null root, an array or a primitive reads
 	// as an empty config instead of throwing on property access.
@@ -89,6 +93,12 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 			? Math.trunc(rawPct)
 			: 35;
 	const toolsWidthPct = Math.max(20, Math.min(60, usablePct));
+	// filesWidth: a real finite number ≥ 24 cols (capped at 200), else auto.
+	const rawFw: unknown = root.filesWidth;
+	const filesWidth =
+		typeof rawFw === "number" && Number.isFinite(rawFw) && rawFw >= 24
+			? Math.min(200, Math.trunc(rawFw))
+			: null;
 	return {
 		split,
 		thinking: split && boolOr(root.thinking, true),
@@ -100,6 +110,7 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 		trimResponse: boolOr(root.trimResponse, false),
 		bandHeight,
 		toolsWidthPct,
+		filesWidth,
 	};
 }
 

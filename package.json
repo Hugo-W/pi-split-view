@@ -1,9 +1,10 @@
 {
 	"name": "pi-split-view",
-	"version": "1.1.0",
+	"version": "1.2.0",
 	"description": "Split-view TUI extension for the pi coding agent: thinking/tool band, files dock with edit-diff subpanel, response-only transcript mode",
 	"scripts": {
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"test": "node --test test/*.test.ts"
 	},
 	"license": "MIT",
 	"repository": {
@@ -20,6 +21,7 @@
 	],
 	"files": [
 		"split-view.ts",
+		"helpers.ts",
 		"layout-manager.ts",
 		"ui-panels-config.ts",
 		"README.md",
