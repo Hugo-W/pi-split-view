@@ -39,7 +39,7 @@ jobs:
 
       - name: Verify tag matches package.json version
         run: |
-          if [ "v${{ github.ref_name }}" != "v$(node -p require('./package.json').version)" ]; then
+          if [ "${{ github.ref_name }}" != "v$(node -p require('./package.json').version)" ]; then
             echo "Tag ${{ github.ref_name }} does not match package.json version"; exit 1
           fi
 
