@@ -1,6 +1,9 @@
 {
 	"name": "pi-split-view",
-	"version": "1.2.0",
+	"version": "1.2.1",
+	"engines": {
+		"node": ">=18.0.0"
+	},
 	"description": "Split-view TUI extension for the pi coding agent: thinking/tool band, files dock with edit-diff subpanel, response-only transcript mode",
 	"scripts": {
 		"typecheck": "tsc --noEmit",
