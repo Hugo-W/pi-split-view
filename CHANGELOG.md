@@ -2,6 +2,17 @@
 
 Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Zooming the Tool Usage panel (`[↗]`) now shows full detail for every tool: its whole
+  stored output (up to 20 lines) instead of the 2-line preview, whatever the
+  `/split-tools-view` mode.
+- Tool results that contain images (e.g. `read` on an image file) render inline in the
+  Tool Usage panel in full detail and zoomed views, using pi-tui's `Image` component like
+  pi's transcript does (Kitty/iTerm2). Other terminals show pi's text fallback.
+
 ## [1.2.0] — 2026-10-21
 
 ### Added

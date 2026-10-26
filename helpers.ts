@@ -130,6 +130,42 @@ export function capDisplayLine(line: string, max: number): string {
 	return "… " + line.slice(start);
 }
 
+/** One inline-image block of a tool result (base64 data + MIME type). */
+export interface ImageBlock {
+	data: string;
+	mimeType: string;
+}
+
+/** The LAST image block of a tool result's content, if any. Content is
+ * either a plain string or an array of blocks; only well-formed image blocks
+ * (string `data` + `mimeType`) count. Keeping the last one matches how pi's
+ * transcript renders results (one image per `read`; rare multi-image results
+ * keep the most recent). */
+export function lastImageBlock(content: unknown): ImageBlock | undefined {
+	if (!Array.isArray(content)) return undefined;
+	for (let i = content.length - 1; i >= 0; i--) {
+		const c = content[i] as any;
+		if (
+			c?.type === "image" &&
+			typeof c.data === "string" &&
+			typeof c.mimeType === "string"
+		)
+			return { data: c.data, mimeType: c.mimeType };
+	}
+	return undefined;
+}
+
+/** The first `cap` lines of an already-trimmed output list, plus how many
+ * lines were hidden (for the "+N more" marker). `cap <= 0` shows nothing. */
+export function outputPreview(
+	lines: string[],
+	cap: number,
+): { shown: string[]; hidden: number } {
+	if (cap <= 0 || lines.length === 0) return { shown: [], hidden: lines.length };
+	const shown = lines.slice(0, cap);
+	return { shown, hidden: lines.length - shown.length };
+}
+
 /** pi auto-discovers every *.ts in an extensions dir; no-op factory. */
 export default function (_pi: ExtensionAPI) {
 	/* shared helper module, not a real extension */

@@ -7,6 +7,8 @@ import {
 	capToolText,
 	dockColsFor,
 	formatDuration,
+	lastImageBlock,
+	outputPreview,
 	truncateInline,
 } from "../helpers.ts";
 import { normalizeConfig } from "../ui-panels-config.ts";
@@ -93,4 +95,49 @@ test("normalizeConfig: filesWidth is a validated optional number", () => {
 	assert.equal(normalizeConfig({ filesWidth: "60" as never }).filesWidth, null);
 	assert.equal(normalizeConfig({ filesWidth: 999 }).filesWidth, 200);
 	assert.equal(normalizeConfig(null as never).bandHeight, 20);
+});
+
+test("lastImageBlock returns the last well-formed image block", () => {
+	// String content (plain-text results) has no image.
+	assert.equal(lastImageBlock("plain text"), undefined);
+	assert.equal(lastImageBlock(undefined), undefined);
+	assert.equal(lastImageBlock({}), undefined);
+	// Text-only block list.
+	assert.equal(lastImageBlock([{ type: "text", text: "hi" }]), undefined);
+	// A read-on-image result: text note + image block.
+	const readResult = [
+		{ type: "text", text: "Read image file [image/png]" },
+		{ type: "image", data: "aGk=", mimeType: "image/png" },
+	];
+	assert.deepEqual(lastImageBlock(readResult), {
+		data: "aGk=",
+		mimeType: "image/png",
+	});
+	// Malformed blocks (missing/non-string data or mimeType) are skipped.
+	assert.equal(
+		lastImageBlock([
+			{ type: "image", data: "aGk=" },
+			{ type: "image", mimeType: "image/png" },
+		]),
+		undefined,
+	);
+	// The LAST image block wins when several are present.
+	const multi = [
+		{ type: "image", data: "MQ==", mimeType: "image/png" },
+		{ type: "image", data: "Mg==", mimeType: "image/jpeg" },
+	];
+	assert.deepEqual(lastImageBlock(multi), { data: "Mg==", mimeType: "image/jpeg" });
+});
+
+test("outputPreview shows the first `cap` lines and counts the hidden rest", () => {
+	assert.deepEqual(outputPreview([], 2), { shown: [], hidden: 0 });
+	assert.deepEqual(outputPreview(["a", "b"], 2), { shown: ["a", "b"], hidden: 0 });
+	assert.deepEqual(outputPreview(["a", "b", "c"], 2), {
+		shown: ["a", "b"],
+		hidden: 1,
+	});
+	// cap 0 (compact mode) shows nothing but still counts the hidden lines.
+	assert.deepEqual(outputPreview(["a", "b"], 0), { shown: [], hidden: 2 });
+	// A cap larger than the list hides nothing.
+	assert.deepEqual(outputPreview(["a"], 20), { shown: ["a"], hidden: 0 });
 });

@@ -27,7 +27,11 @@ transcript mode — composed as one clean layout layer over pi's native transcri
   window with full history left in the transcript.
 - **Tool Usage panel** — every tool call with status/output preview, compact or full detail,
   and its duration (a live elapsed counter while it runs); history is rebuilt from the
-  session branch on resume/branch switch.
+  session branch on resume/branch switch. Zooming the panel (`[↗]`) expands every tool to
+  its full stored output, and tool results that contain images (e.g. `read` on an image
+  file) render inline in full detail / zoomed views on terminals with image support
+  (Kitty/iTerm2), with pi's text fallback otherwise — the same behaviour as pi's native
+  transcript.
 - **Files panel** — right dock in fullscreen (or a passive overlay in regular mode) listing
   read/written/seen files newest-first, with a live edit-diff subpanel (hide the subpanel
   with `/split-diff` and keep just the list); a compact status widget below the editor.
@@ -46,7 +50,7 @@ transcript mode — composed as one clean layout layer over pi's native transcri
 
 | Where | Action |
 | --- | --- |
-| `[↗]` / `[↙]` in a panel header | expand the panel over the whole area above the editor / restore |
+| `[↗]` / `[↙]` in a panel header | expand the panel over the whole area above the editor / restore (a zoomed Tool Usage panel always shows full detail) |
 | `[×]` in a panel header | hide the panel (its command brings it back) |
 | band's bottom border, or the line under the band | drag to change the band height |
 | left edge of the Tool Usage panel | drag to change the thinking ↔ tools split |
@@ -63,7 +67,7 @@ Drag-resizes behave like the matching commands: they last for the current window
 | `/split` | full toggle pair: OFF = all panels off (bare pi layout), ON = the panel flags saved as startup defaults (falls back to thinking + tools if the saved layout has nothing on) |
 | `/split-thinking` | toggle the thinking panel within the band |
 | `/split-tools` | toggle the tool panel within the band |
-| `/split-tools-view` | compact ↔ full tool detail |
+| `/split-tools-view` | compact ↔ full tool detail (full detail shows output previews and inline image results; zoom implies full detail) |
 | `/split-tools-width <pct>` | tools panel width as % of the band (20–60, default 35) |
 | `/files` | toggle the files panel (dock in fullscreen, overlay in regular mode) |
 | `/split-diff` | toggle the files panel's edit-diff subpanel (keep the file list only) |

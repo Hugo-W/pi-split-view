@@ -92,9 +92,13 @@ import {
 import {
 	Container,
 	HStack,
+	Image,
 	ScrollView,
 	Spacer,
 	VStack,
+	getCapabilities,
+	getImageDimensions,
+	imageFallback,
 	type Component,
 	type OverlayHandle,
 	type TuiMouseEvent,
@@ -123,7 +127,10 @@ import {
 	capToolText,
 	dockColsFor as dockColsForManual,
 	formatDuration,
+	lastImageBlock,
+	outputPreview,
 	truncateInline,
+	type ImageBlock,
 } from "./helpers.ts";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -597,6 +604,9 @@ interface ToolEntry {
 	isError: boolean;
 	subagent?: boolean;
 	agent?: string;
+	/** Last image block of the result (e.g. `read` on an image file), so the
+	 * panel can render it inline like pi's transcript does. */
+	image?: ImageBlock;
 	/** Wall-clock start/end (ms) of LIVE calls; absent for resumed history. */
 	startedAt?: number;
 	endedAt?: number;
@@ -690,16 +700,36 @@ function ingestToolResult(id: string, result: any, isError: boolean, endedAt?: n
 	if (endedAt !== undefined && e.startedAt !== undefined) e.endedAt = endedAt;
 	const text = resultText(result);
 	if (text) setToolOutput(e, text);
+	// Keep the last image block so the tools panel can render it inline on
+	// terminals with image support (pi's transcript does the same via pi-tui's
+	// Image component; resultText drops non-text blocks).
+	const img = lastImageBlock(result?.content);
+	if (img) e.image = img;
 	e.active = false;
 	e.isError = isError;
 	cancelPendingToolsFlush();
 	toolsVersionCounter++;
 }
 
-function toolLines(theme: Theme, width: number): string[] {
+/** One row-source item of a band panel body: a styled text line, or an
+ * inline image block. Image items render RAW via pi-tui's Image component
+ * (never wrapped, capped or padded) — the same line structure pi's own
+ * transcript feeds its ScrollView, which the TUI engine handles (image-aware
+ * scrollbar, scroll cropping, placement cleanup on full repaints). */
+type BodyItem = string | { image: ImageBlock };
+
+/** Zoomed tools panel: show full detail for every tool — its whole stored
+ * output (≤ MAX_TOOL_OUTPUT_LINES) instead of the 2-line band preview. */
+const toolOutputCap = (zoomedTools: boolean) =>
+	zoomedTools ? MAX_TOOL_OUTPUT_LINES : 2;
+
+function toolItems(theme: Theme, width: number): BodyItem[] {
 	const th = theme;
-	const out: string[] = [];
-	const full = toolMode === "full";
+	const out: BodyItem[] = [];
+	// Zooming the tools panel expands it over the whole area above the editor,
+	// so it always renders full detail regardless of the compact/full toggle.
+	const zoomedTools = zoomed === "tools";
+	const full = toolMode === "full" || zoomedTools;
 	// Text budget inside the frame: 1 col inset + ≥2 trailing pad cols
 	// (the transient scrollbar paints over the pad, never the frame).
 	const textWidth = Math.max(8, width - 3);
@@ -743,10 +773,16 @@ function toolLines(theme: Theme, width: number): string[] {
 		if (content.length === 0) {
 			if (e.active) out.push(th.fg("dim", "  · …"));
 		} else {
-			for (const l of content.slice(0, 2))
+			const { shown, hidden } = outputPreview(content, toolOutputCap(zoomedTools));
+			for (const l of shown)
 				out.push(th.fg("toolOutput", `  · ${truncateInline(l, textWidth - 4)}`));
-			if (content.length > 2)
-				out.push(th.fg("dim", `  · +${content.length - 2} more`));
+			if (hidden > 0) out.push(th.fg("dim", `  · +${hidden} more`));
+		}
+		// Inline image result (e.g. read on an image file), like pi's
+		// transcript: a separator row, then the image as a raw item.
+		if (e.image) {
+			out.push("");
+			out.push({ image: e.image });
 		}
 	}
 	return out;
@@ -1165,6 +1201,13 @@ class MeasurementSafeVStack extends VStack {
  * edge is continuous when content is short. Output is cached on
  * (version, minRows, width); wrapped rows are memoized per source line, so a
  * streaming flush only re-wraps lines that changed (the tail).
+ *
+ * Row sources are BodyItems: text lines go through the wrap/edge/pad path;
+ * image items render raw via a cached pi-tui Image component (atomic group,
+ * no edge/pad — the escape lines must stay contiguous and unsliced, exactly
+ * the structure pi's transcript feeds its ScrollView; the TUI engine is
+ * image-aware: the scrollbar skips image lines, scrolling crops placements,
+ * full repaints clear them).
  */
 class RecentBody implements Component {
 	private cacheVersion = -1;
@@ -1175,10 +1218,15 @@ class RecentBody implements Component {
 	/** Per-line wrap memo for one width; holds only the lines last shown. */
 	private wrapWidth = -1;
 	private wrapMemo = new Map<string, string[]>();
+	/** Image components by (mimeType:data), small LRU. Cached so a re-render
+	 * re-emits the SAME Kitty image ID — a fresh instance per frame would
+	 * allocate a new placement every frame and leak them in the terminal. */
+	private imageCache = new Map<string, Image>();
+	private static readonly MAX_CACHED_IMAGES = 8;
 	constructor(
 		private theme: Theme,
 		private style: (line: string) => string,
-		private lines: (width: number) => string[],
+		private lines: (width: number) => BodyItem[],
 		private version: () => number,
 		private empty: string,
 		/** Rows to guarantee so the left edge has no gaps (viewport height). */
@@ -1213,31 +1261,31 @@ class RecentBody implements Component {
 		// SV-03/SV-04: fragments of ONE source line are wrapped as a group and
 		// inserted in order; the cap counts VISUAL rows. A group that would
 		// straddle the cap is skipped whole; a single group larger than the
-		// whole cap keeps only its newest fragments.
+		// whole cap keeps only its newest fragments — except an image group,
+		// which is atomic (its escape lines must stay contiguous and unsliced)
+		// and therefore kept whole (its height is bounded by the Image
+		// component's maxHeightCells, far below MAX_BODY_ROWS in practice).
 		const src = this.lines(width);
-		const groups: string[][] = [];
+		const groups: { frags: string[]; raw: boolean }[] = [];
 		let used = 0;
 		for (let i = src.length - 1; i >= 0; i--) {
-			const raw = src[i];
-			let frags = nextMemo.get(raw) ?? memo.get(raw);
-			if (!frags) {
-				frags = wrapTextWithAnsi(
-					this.style(capDisplayLine(raw, MAX_LINE_CHARS)),
-					Math.max(1, width - 3),
-				).map((w: string) => " " + w);
-			}
-			nextMemo.set(raw, frags);
+			const { frags, raw } = this.itemFrags(src[i], width, memo, nextMemo);
 			if (used + frags.length > MAX_BODY_ROWS) {
 				if (groups.length === 0 && frags.length > MAX_BODY_ROWS)
-					groups.push(frags.slice(frags.length - MAX_BODY_ROWS));
+					groups.push({
+						frags: raw ? frags : frags.slice(frags.length - MAX_BODY_ROWS),
+						raw,
+					});
 				break;
 			}
-			groups.push(frags);
+			groups.push({ frags, raw });
 			used += frags.length;
 		}
 		this.wrapMemo = nextMemo;
 		const rows: string[] = [];
-		for (let g = groups.length - 1; g >= 0; g--) for (const f of groups[g]) rows.push(f);
+		for (let g = groups.length - 1; g >= 0; g--)
+			for (const f of groups[g].frags)
+				rows.push(groups[g].raw ? f : edge + f + pad(f));
 		let out: string[];
 		if (rows.length === 0) {
 			const empty = " " + th.fg("dim", this.empty);
@@ -1253,6 +1301,61 @@ class RecentBody implements Component {
 			this.cacheByWidth.delete(oldest);
 		}
 		return out;
+	}
+	/** Fragments for one row-source item: text lines are wrapped (memoized
+	 * per line) and emit with the frame edge; image items go to imageRows.
+	 * `raw` rows bypass the edge/pad pass. */
+	private itemFrags(
+		item: BodyItem,
+		width: number,
+		memo: Map<string, string[]>,
+		nextMemo: Map<string, string[]>,
+	): { frags: string[]; raw: boolean } {
+		if (typeof item !== "string") return this.imageRows(item.image, width);
+		const memoFrags = nextMemo.get(item) ?? memo.get(item);
+		const frags =
+			memoFrags ??
+			wrapTextWithAnsi(
+				this.style(capDisplayLine(item, MAX_LINE_CHARS)),
+				Math.max(1, width - 3),
+			).map((w: string) => " " + w);
+		nextMemo.set(item, frags);
+		return { frags, raw: false };
+	}
+	/** Render one image item. Terminals with image support get the raw rows
+	 * from a cached pi-tui Image component. Without image support, pi's text
+	 * fallback (imageFallback), as a normal padded text row. */
+	private imageRows(
+		img: ImageBlock,
+		width: number,
+	): { frags: string[]; raw: boolean } {
+		const th = this.theme;
+		if (!getCapabilities().images) {
+			const dims = getImageDimensions(img.data, img.mimeType) ?? undefined;
+			const fb = th.fg("toolOutput", imageFallback(img.mimeType, dims));
+			return {
+				frags: wrapTextWithAnsi(
+					capDisplayLine(fb, MAX_LINE_CHARS),
+					Math.max(1, width - 3),
+				).map((w: string) => " " + w),
+				raw: false,
+			};
+		}
+		const key = `${img.mimeType}:${img.data}`;
+		let component = this.imageCache.get(key);
+		if (component) {
+			// LRU touch.
+			this.imageCache.delete(key);
+			this.imageCache.set(key, component);
+		} else {
+			component = new Image(img.data, img.mimeType, {
+				fallbackColor: (s: string) => th.fg("toolOutput", s),
+			});
+			this.imageCache.set(key, component);
+			while (this.imageCache.size > RecentBody.MAX_CACHED_IMAGES)
+				this.imageCache.delete(this.imageCache.keys().next().value as string);
+		}
+		return { frags: component.render(width), raw: true };
 	}
 	handleMouse(ev: TuiMouseEvent): TuiMouseEventResult | undefined {
 		return panelMouse(ev, this.ctl, "body");
@@ -1433,7 +1536,7 @@ interface BandDef {
 	color: "accent" | "muted";
 	streaming: () => boolean;
 	style: (line: string) => string;
-	lines: (width: number) => string[];
+	lines: (width: number) => BodyItem[];
 	version: () => number;
 	empty: string;
 }
@@ -1454,7 +1557,7 @@ function bandDef(theme: Theme, id: "thinking" | "tools"): BandDef {
 				color: "muted",
 				streaming: () => toolOrder.some((id) => toolsBy.get(id)?.active),
 				style: (l) => l,
-				lines: (w) => toolLines(theme, w),
+				lines: (w) => toolItems(theme, w),
 				version: toolsVersion,
 				empty: "No tools called yet",
 			};
