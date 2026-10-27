@@ -150,6 +150,8 @@ const MAX_FILES = 500;
 const MAX_WIDGET_NAMES = 3;
 const MIN_TERM_WIDTH = 90;
 const MAX_TOOL_OUTPUT_LINES = 20;
+/** Lines of an edit's unified diff kept per tool entry (zoomed tools view). */
+const MAX_TOOL_DIFF_LINES = 150;
 // OracleSpec body window: hard cap on FINAL VISUAL rows rendered by band
 // panels (logical lines can wrap into many). Wrapped rows are memoized per
 // line, so only changed lines (the streaming tail) re-wrap on a flush.
@@ -607,6 +609,9 @@ interface ToolEntry {
 	/** Last image block of the result (e.g. `read` on an image file), so the
 	 * panel can render it inline like pi's transcript does. */
 	image?: ImageBlock;
+	/** Raw unified diff of an `edit` result (details.diff), shown in the
+	 * zoomed tools view; capped to MAX_TOOL_DIFF_LINES. */
+	diff?: string;
 	/** Wall-clock start/end (ms) of LIVE calls; absent for resumed history. */
 	startedAt?: number;
 	endedAt?: number;
@@ -705,6 +710,13 @@ function ingestToolResult(id: string, result: any, isError: boolean, endedAt?: n
 	// Image component; resultText drops non-text blocks).
 	const img = lastImageBlock(result?.content);
 	if (img) e.image = img;
+	const diff = result?.details?.diff;
+	if (typeof diff === "string" && diff) {
+		const lines = capToolText(diff).split(/\r?\n/);
+		e.diff = lines.slice(0, MAX_TOOL_DIFF_LINES).join("\n");
+		if (lines.length > MAX_TOOL_DIFF_LINES)
+			e.diff += `\n… +${lines.length - MAX_TOOL_DIFF_LINES} more diff lines`;
+	}
 	e.active = false;
 	e.isError = isError;
 	cancelPendingToolsFlush();
@@ -716,7 +728,11 @@ function ingestToolResult(id: string, result: any, isError: boolean, endedAt?: n
  * (never wrapped, capped or padded) — the same line structure pi's own
  * transcript feeds its ScrollView, which the TUI engine handles (image-aware
  * scrollbar, scroll cropping, placement cleanup on full repaints). */
-type BodyItem = string | { image: ImageBlock };
+type BodyItem = string | { image: ImageBlock; maxRows?: number };
+
+/** Band (non-zoomed) tools panel: inline images are thumbnails capped at
+ * this many rows so they don't crowd the small panel. Zoomed: pi's default. */
+const BAND_IMAGE_ROWS = 6;
 
 /** Zoomed tools panel: show full detail for every tool — its whole stored
  * output (≤ MAX_TOOL_OUTPUT_LINES) instead of the 2-line band preview. */
@@ -778,11 +794,21 @@ function toolItems(theme: Theme, width: number): BodyItem[] {
 				out.push(th.fg("toolOutput", `  · ${truncateInline(l, textWidth - 4)}`));
 			if (hidden > 0) out.push(th.fg("dim", `  · +${hidden} more`));
 		}
-		// Inline image result (e.g. read on an image file), like pi's
-		// transcript: a separator row, then the image as a raw item.
-		if (e.image) {
+		// Zoomed: an edit's diff, rendered like pi's transcript (renderDiff
+		// colours +/- lines); long lines wrap in the body.
+		if (zoomedTools && e.diff) {
 			out.push("");
-			out.push({ image: e.image });
+			for (const l of renderDiff(e.diff).split(/\r?\n/)) out.push(`    ${l}`);
+		}
+		// Inline image result (e.g. read on an image file), like pi's
+		// transcript: a separator row, then the image as a raw item. Without
+		// image support it's a one-line text fallback styled as an output row.
+		if (e.image) {
+			if (getCapabilities().images) out.push("");
+			out.push({
+				image: e.image,
+				maxRows: zoomedTools ? undefined : BAND_IMAGE_ROWS,
+			});
 		}
 	}
 	return out;
@@ -1291,7 +1317,8 @@ class RecentBody implements Component {
 			const empty = " " + th.fg("dim", this.empty);
 			out = [edge + empty + pad(empty)];
 		} else {
-			out = rows.map((r) => edge + r + pad(r));
+			// Rows already carry the edge/pad (text) or are raw (image).
+			out = rows;
 		}
 		const filler = edge + " ".repeat(Math.max(0, width - 1));
 		while (out.length < min) out.push(filler);
@@ -1311,7 +1338,8 @@ class RecentBody implements Component {
 		memo: Map<string, string[]>,
 		nextMemo: Map<string, string[]>,
 	): { frags: string[]; raw: boolean } {
-		if (typeof item !== "string") return this.imageRows(item.image, width);
+		if (typeof item !== "string")
+			return this.imageRows(item.image, width, item.maxRows);
 		const memoFrags = nextMemo.get(item) ?? memo.get(item);
 		const frags =
 			memoFrags ??
@@ -1328,11 +1356,13 @@ class RecentBody implements Component {
 	private imageRows(
 		img: ImageBlock,
 		width: number,
+		maxRows?: number,
 	): { frags: string[]; raw: boolean } {
 		const th = this.theme;
 		if (!getCapabilities().images) {
 			const dims = getImageDimensions(img.data, img.mimeType) ?? undefined;
-			const fb = th.fg("toolOutput", imageFallback(img.mimeType, dims));
+			// Aligned with the tool's output rows ("  · …").
+			const fb = th.fg("toolOutput", `  · ${imageFallback(img.mimeType, dims)}`);
 			return {
 				frags: wrapTextWithAnsi(
 					capDisplayLine(fb, MAX_LINE_CHARS),
@@ -1341,21 +1371,34 @@ class RecentBody implements Component {
 				raw: false,
 			};
 		}
-		const key = `${img.mimeType}:${img.data}`;
+		const key = `${maxRows ?? ""}:${img.mimeType}:${img.data}`;
 		let component = this.imageCache.get(key);
 		if (component) {
 			// LRU touch.
 			this.imageCache.delete(key);
 			this.imageCache.set(key, component);
 		} else {
-			component = new Image(img.data, img.mimeType, {
-				fallbackColor: (s: string) => th.fg("toolOutput", s),
-			});
+			component = new Image(
+				img.data,
+				img.mimeType,
+				{ fallbackColor: (s: string) => th.fg("toolOutput", s) },
+				maxRows ? { maxHeightCells: maxRows } : {},
+			);
 			this.imageCache.set(key, component);
 			while (this.imageCache.size > RecentBody.MAX_CACHED_IMAGES)
 				this.imageCache.delete(this.imageCache.keys().next().value as string);
 		}
-		return { frags: component.render(width), raw: true };
+		// Frame edge + 2-col inset before the image. Placement escapes draw at
+		// the cursor column (Kitty C=1, iTerm2 cursor-up keeps the column), so
+		// prefixing shifts the image right; blank reserved rows get the edge
+		// and pad like any text row.
+		const edge = th.fg("border", "│");
+		const inset = edge + "  ";
+		const blank = edge + " ".repeat(Math.max(0, width - 1));
+		const rows = component
+			.render(Math.max(1, width - 4))
+			.map((l: string) => (l ? inset + l : blank));
+		return { frags: rows, raw: true };
 	}
 	handleMouse(ev: TuiMouseEvent): TuiMouseEventResult | undefined {
 		return panelMouse(ev, this.ctl, "body");
@@ -1922,7 +1965,9 @@ export default function (pi: ExtensionAPI) {
 			// to their calls by toolCallId.
 			if (msg.role === "toolResult" && typeof msg.toolCallId === "string") {
 				try {
-					ingestToolResult(msg.toolCallId, msg.content, msg.isError);
+					// Pass the whole message (content + details), the same
+					// shape as a live result.
+					ingestToolResult(msg.toolCallId, msg, msg.isError);
 				} catch {
 					/* skip */
 				}

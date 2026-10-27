@@ -2,7 +2,7 @@
 
 Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.3.0] — 2026-10-27
 
 ### Added
 
@@ -11,7 +11,15 @@ Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
   `/split-tools-view` mode.
 - Tool results that contain images (e.g. `read` on an image file) render inline in the
   Tool Usage panel in full detail and zoomed views, using pi-tui's `Image` component like
-  pi's transcript does (Kitty/iTerm2). Other terminals show pi's text fallback.
+  pi's transcript does (Kitty/iTerm2). Other terminals show pi's text fallback. In the
+  (non-zoomed) band the image is a thumbnail of at most 6 rows.
+- The zoomed Tool Usage panel shows each `edit` call's coloured diff (up to 150 lines).
+
+### Fixed
+
+- Thinking / Tool Usage panel text rows no longer get a doubled left edge (`│`).
+- Tool outputs rebuilt on resume / branch switch are no longer empty (the ingest path got
+  the content array instead of the result message).
 
 ## [1.2.0] — 2026-10-21
 
