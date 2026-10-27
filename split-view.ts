@@ -47,7 +47,9 @@
  * swapped for an extension-owned ScrollView over a document of user / assistant
  * messages (reused from branch + streamed live via pi's own message
  * components), so rendering matches the native transcript minus tool calls,
- * thinking blocks and extension custom entries. The editor dock
+ * thinking blocks and extension custom entries. pi's startup header and
+ * loaded-resources listing stay mounted above those messages (SV-26). The
+ * editor dock
  * (pending/status/editor/footer) is reused verbatim, so input is untouched.
  *
  * Response-only is native-parity BY DESIGN (SV-09/SV-10/SV-18, USER DECISION
@@ -1775,6 +1777,24 @@ function buildZoom(theme: Theme, id: PanelId): Component | null {
  */
 let responseScrollView: ScrollView | null = null;
 
+/** Container for the trimmed doc (startup containers + response doc), the
+ * child of responseScrollView. Built lazily; holds live references into pi's
+ * base tree, so it stays valid across theme changes and resource reloads. */
+let responseDocHost: Container | null = null;
+
+/** Extract the transcript ScrollView from pi's base root (VStack[transcript,
+ * dock]): the entry with an own `child` property (baseDockOf finds the other
+ * one). */
+function baseTranscriptOf(base: any): Component | null {
+	const entries = base?.entries;
+	if (!Array.isArray(entries)) return null;
+	for (const e of entries) {
+		const c = e?.component;
+		if (c && Object.hasOwn(c, "child")) return c as Component;
+	}
+	return null;
+}
+
 /** Extract the editor dock from pi's base root (VStack[transcript, dock]). */
 function baseDockOf(base: any): Component | null {
 	const entries = base?.entries;
@@ -1789,6 +1809,37 @@ function baseDockOf(base: any): Component | null {
 	return null;
 }
 
+/**
+ * SV-26: build the trimmed panel's document: pi's own startup header and
+ * loaded-resources containers mounted above the response doc. Those two
+ * containers are children[0..1] of the transcript's documentContainer and
+ * hold the startup banner + [Context]/[Skills]/[Prompts]/[Extensions]
+ * listing. Trim mode unmounts the base transcript, which erased them; the
+ * response doc mirrors branch messages only and never contained them.
+ * Mounting the LIVE instances here (not snapshots) keeps ctrl+o header
+ * expansion, theme updates and /reload resource refreshes working, and never
+ * double-mounts: while trim is on the base transcript is unmounted, and when
+ * trim toggles off these containers return with it. Requires exactly the
+ * expected [header, resources, chat] triple; any other shape degrades to the
+ * old response-only doc (never risk mounting chatContainer here).
+ */
+function buildTrimDoc(base: Component): Container {
+	if (!responseDocHost) {
+		responseDocHost = new Container();
+		try {
+			const kids = (baseTranscriptOf(base) as any)?.child?.children;
+			if (Array.isArray(kids) && kids.length === 3) {
+				responseDocHost.addChild(kids[0]);
+				responseDocHost.addChild(kids[1]);
+			}
+		} catch {
+			/* unexpected tree shape — response doc only */
+		}
+		responseDocHost.addChild(responseDoc);
+	}
+	return responseDocHost;
+}
+
 /** Build the trimmed inner: VStack([responseScroll, dock]) like pi's viewport. */
 function buildTrimInner(theme: Theme): Component | null {
 	const base = getBaseRoot();
@@ -1796,7 +1847,7 @@ function buildTrimInner(theme: Theme): Component | null {
 	const dock = baseDockOf(base);
 	if (!dock) return null;
 	if (!responseScrollView) {
-		responseScrollView = new ScrollView(responseDoc, {
+		responseScrollView = new ScrollView(buildTrimDoc(base), {
 			follow: "end",
 			// A1: in trim mode pi's own transcript (primary) is not mounted;
 			// without this the FIRST laid-out ScrollView — the Thinking panel —

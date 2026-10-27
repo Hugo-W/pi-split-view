@@ -2,6 +2,16 @@
 
 Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 
+## [1.3.1] — 2026-10-27
+
+### Fixed
+
+- Response-only mode (`/split-trim-response`) no longer erases pi's startup transcript: the startup
+  banner and the `[Context]`/`[Skills]`/`[Prompts]`/`[Extensions]` resource listing now stay
+  visible at the top of the response panel. The panel mounts pi's own live header and
+  loaded-resources containers (previously they were unmounted together with the replaced
+  transcript), so `ctrl+o` expansion, theme changes and resource refreshes keep working.
+
 ## [1.3.0] — 2026-10-27
 
 ### Added
