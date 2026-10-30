@@ -2,6 +2,28 @@
 
 Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 
+## [1.4.0] — 2026-10-30
+
+### Added
+
+- `thinkingScope` config key, toggled with `/split-thinking-scope [turn|session]` (default
+  `turn`): the Thinking panel now carries only the current turn's reasoning. A new user
+  message clears the panel's buffer, so it no longer fills up with the reasoning of every
+  earlier turn; the text itself still lives in the transcript, and `session` restores the
+  previous accumulate-everything behaviour. An interrupted turn used to leave a dangling
+  streamed block behind, which the next `thinking.start()` then pushed into the history —
+  that residue is dropped along with the rest of the turn. `/split-save` persists the scope.
+
+### Fixed
+
+- Scrolling the Thinking panel away from the end no longer slides under you while reasoning
+  streams. The panel body rebuilt a newest-`MAX_BODY_ROWS` window on every 50 ms flush, so a
+  fixed scroll offset resolved to different text each time a line arrived — scrolling up was
+  impossible to hold. The Thinking panel now renders its whole buffer, which is already
+  bounded by `MAX_LINES`; the Tool Usage panel keeps the windowed body it needs. A buffer
+  that exceeds `MAX_LINES` still drops its oldest rows, so a very long single turn can shift
+  under a scrolled-away panel — that is the remaining limit.
+
 ## [1.3.1] — 2026-10-27
 
 ### Fixed

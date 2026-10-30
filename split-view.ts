@@ -114,6 +114,7 @@ import {
 	saveUiPanelsConfig,
 	normalizeConfig,
 	type ToolMode as ToolModeCfg,
+	type ThinkingScope,
 } from "./ui-panels-config.ts";
 import {
 	getBaseRoot,
@@ -200,6 +201,10 @@ let termHeight = 0;
 
 // Panel enable flags (kept in sync with config; thinking/tools default true).
 let thinkingOn = true;
+/** SV-27: "turn" = the thinking panel carries the current turn only (the
+ * buffer is cleared on each new user message); "session" = accumulate every
+ * turn. Session-local; /split-thinking-scope, persisted by /split-save. */
+let thinkingScope: ThinkingScope = "turn";
 let toolsOn = true;
 let filesOn = false;
 /** Files panel edit-diff subpanel (session-local; /split-diff, persisted by
@@ -1260,6 +1265,9 @@ class RecentBody implements Component {
 		/** Rows to guarantee so the left edge has no gaps (viewport height). */
 		private minRows: () => number,
 		private ctl?: PanelCtl,
+		/** SV-27: false = emit every row of the source instead of the newest
+		 * MAX_BODY_ROWS window. See BandDef.windowed. */
+		private windowed = true,
 	) {}
 	render(width: number): string[] {
 		const th = this.theme;
@@ -1298,7 +1306,11 @@ class RecentBody implements Component {
 		let used = 0;
 		for (let i = src.length - 1; i >= 0; i--) {
 			const { frags, raw } = this.itemFrags(src[i], width, memo, nextMemo);
-			if (used + frags.length > MAX_BODY_ROWS) {
+			// SV-27: a non-windowed body keeps walking past the cap; the caller
+			// guarantees the source is bounded (thinking: MAX_LINES). The
+			// newest-first collection order is kept either way, so the reverse
+			// pass below still emits oldest-to-newest.
+			if (this.windowed && used + frags.length > MAX_BODY_ROWS) {
 				if (groups.length === 0 && frags.length > MAX_BODY_ROWS)
 					groups.push({
 						frags: raw ? frags : frags.slice(frags.length - MAX_BODY_ROWS),
@@ -1584,6 +1596,9 @@ interface BandDef {
 	lines: (width: number) => BodyItem[];
 	version: () => number;
 	empty: string;
+	/** SV-27: false = the body emits its whole row source instead of the newest
+	 * MAX_BODY_ROWS window. Defaults to true (windowed). */
+	windowed?: boolean;
 }
 
 function bandDef(theme: Theme, id: "thinking" | "tools"): BandDef {
@@ -1596,6 +1611,11 @@ function bandDef(theme: Theme, id: "thinking" | "tools"): BandDef {
 				lines: (w) => thinkingLines(theme, w),
 				version: () => thinking.version,
 				empty: "Thinking idle",
+				// SV-27: the thinking buffer is already capped at MAX_LINES, and a
+				// sliding newest-N window makes a fixed scrollTop resolve to
+				// different text on every streaming flush — scroll up and the panel
+				// keeps sliding under you. Emit the whole buffer instead.
+				windowed: false,
 			}
 		: {
 				title: "Tool Usage",
@@ -1627,6 +1647,7 @@ function framedPanel(theme: Theme, d: BandDef, ctl: PanelCtl): Component {
 		d.empty,
 		() => ctl.scroll?.viewportHeight || bandHeight - 2,
 		ctl,
+		d.windowed ?? true,
 	);
 	const scroll = new ScrollView(body, {
 		follow: "end",
@@ -2051,6 +2072,7 @@ export default function (pi: ExtensionAPI) {
 			};
 		}
 		thinkingOn = cfg.thinking;
+		thinkingScope = cfg.thinkingScope;
 		toolsOn = cfg.tools;
 		toolMode = cfg.toolMode;
 		bandHeight = cfg.bandHeight;
@@ -2116,6 +2138,14 @@ export default function (pi: ExtensionAPI) {
 	// so tool-only / thinking-only rounds add nothing to the doc.
 	pi.on("message_start", (event) => {
 		const msg = (event as any).message;
+		// SV-27: a new user message starts a new turn — with thinkingScope
+		// "turn" the panel drops the previous turn's reasoning here (it stays in
+		// the transcript, and reconstruct() restores it on resume/branch switch).
+		// Clearing on thinking_start instead would wipe the earlier blocks of the
+		// SAME turn, since one assistant message can stream several of them.
+		if (msg?.role === "user" && thinkingScope === "turn") {
+			thinking.reset();
+		}
 		if (msg?.role === "user") addResponseMessage(msg);
 		if (anyPanelActive()) requestRender();
 	});
@@ -2428,6 +2458,26 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("split-thinking-scope", {
+		description:
+			"Thinking panel buffer: turn (current turn only) | session (all turns)",
+		handler: async (args, ctx) => {
+			if (ctx.mode !== "tui") return;
+			const arg = String(args ?? "").trim().toLowerCase();
+			if (arg === "turn") thinkingScope = "turn";
+			else if (arg === "session") thinkingScope = "session";
+			else thinkingScope = thinkingScope === "turn" ? "session" : "turn";
+			// Switching back to "turn" takes effect now instead of at the next
+			// user message, so the command's feedback matches the panel.
+			if (thinkingScope === "turn") thinking.reset();
+			if (anyPanelActive()) requestRender();
+			ctx.ui.notify(
+				`Thinking panel: ${thinkingScope === "turn" ? "current turn only" : "all turns"}`,
+				"info",
+			);
+		},
+	});
+
 	pi.registerCommand("split-tools", {
 		description: "Toggle the tools panel within the band",
 		handler: async (_args, ctx) => {
@@ -2582,6 +2632,7 @@ export default function (pi: ExtensionAPI) {
 				files: filesEffective,
 				toolMode,
 				trimResponse,
+				thinkingScope,
 				bandHeight,
 				toolsWidthPct,
 				...(filesWidth === null ? {} : { filesWidth }),
