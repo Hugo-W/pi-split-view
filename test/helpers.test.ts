@@ -9,6 +9,7 @@ import {
 	formatDuration,
 	lastImageBlock,
 	outputPreview,
+	thoughtsSinceLastUser,
 	truncateInline,
 } from "../helpers.ts";
 import { normalizeConfig } from "../ui-panels-config.ts";
@@ -95,6 +96,39 @@ test("normalizeConfig: filesWidth is a validated optional number", () => {
 	assert.equal(normalizeConfig({ filesWidth: "60" as never }).filesWidth, null);
 	assert.equal(normalizeConfig({ filesWidth: 999 }).filesWidth, 200);
 	assert.equal(normalizeConfig(null as never).bandHeight, 20);
+});
+
+test("normalizeConfig: thinkingScope is a strict turn|session read", () => {
+	assert.equal(normalizeConfig({}).thinkingScope, "turn");
+	assert.equal(normalizeConfig({ thinkingScope: "session" }).thinkingScope, "session");
+	assert.equal(normalizeConfig({ thinkingScope: "turn" }).thinkingScope, "turn");
+	// Anything that is not the literal "session" must fall back to the default.
+	assert.equal(normalizeConfig({ thinkingScope: "all" as never }).thinkingScope, "turn");
+	assert.equal(normalizeConfig({ thinkingScope: true as never }).thinkingScope, "turn");
+	assert.equal(normalizeConfig(null as never).thinkingScope, "turn");
+});
+
+test("thoughtsSinceLastUser keeps only the reasoning after the last user turn", () => {
+	assert.deepEqual(
+		thoughtsSinceLastUser([
+			{ isUser: true, thoughts: [] },
+			{ isUser: false, thoughts: ["a1", "a2"] },
+			{ isUser: true, thoughts: [] },
+			{ isUser: false, thoughts: ["b1"] },
+		]),
+		["b1"],
+	);
+	// No user message yet: the whole sequence counts as one turn.
+	assert.deepEqual(thoughtsSinceLastUser([{ isUser: false, thoughts: ["only"] }]), ["only"]);
+	// A trailing user message that has not been answered yet leaves it empty.
+	assert.deepEqual(
+		thoughtsSinceLastUser([
+			{ isUser: false, thoughts: ["old"] },
+			{ isUser: true, thoughts: [] },
+		]),
+		[],
+	);
+	assert.deepEqual(thoughtsSinceLastUser([]), []);
 });
 
 test("lastImageBlock returns the last well-formed image block", () => {
