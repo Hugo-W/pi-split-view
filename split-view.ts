@@ -39,9 +39,11 @@
  * flanks; the ScrollView's always-on scrollbar (track styled as border) IS the right frame
  * edge, and MeasurementSafeVStack subclasses make the engine's discarded
  * intrinsic-height measurement passes O(1) instead of eagerly rendering whole
- * subtrees (panels + transcript) every keystroke frame. Bodies render a
- * newest-first row-capped window (~96 rows). Full history stays in the
- * transcript; the band is a recent-history view.
+ * subtrees (panels + transcript) every keystroke frame. The Tool Usage body
+ * renders a newest-first visual-row window (MAX_BODY_ROWS); the Thinking body
+ * renders its whole buffer up to MAX_UNWINDOWED_ROWS, so a panel scrolled away
+ * from the end keeps its position while reasoning streams in (SV-27). Full
+ * history stays in the transcript either way.
  *
  * Panel C trim mode (trimResponse): the transcript region of pi's base root is
  * swapped for an extension-owned ScrollView over a document of user / assistant
@@ -114,6 +116,7 @@ import {
 	saveUiPanelsConfig,
 	normalizeConfig,
 	type ToolMode as ToolModeCfg,
+	type ThinkingScope,
 } from "./ui-panels-config.ts";
 import {
 	getBaseRoot,
@@ -132,6 +135,7 @@ import {
 	lastImageBlock,
 	outputPreview,
 	truncateInline,
+	thoughtsSinceLastUser,
 	type ImageBlock,
 } from "./helpers.ts";
 import { existsSync, statSync } from "node:fs";
@@ -158,6 +162,12 @@ const MAX_TOOL_DIFF_LINES = 150;
 // panels (logical lines can wrap into many). Wrapped rows are memoized per
 // line, so only changed lines (the streaming tail) re-wrap on a flush.
 const MAX_BODY_ROWS = 400;
+// SV-27: the thinking panel renders its whole buffer instead of a sliding
+// window, so ITS visual-row bound has to come from here — MAX_LINES counts
+// LOGICAL lines, and one of them can wrap into hundreds of rows. 4x the normal
+// window leaves every realistic turn completely stable while still capping a
+// pathological buffer (beyond it the body falls back to the newest rows).
+const MAX_UNWINDOWED_ROWS = MAX_BODY_ROWS * 4;
 // Hard cap on raw chars per logical line (giant-line guard). ≥ MAX_TAIL_CHARS
 // so the streaming tail is never cut by a sliding (re-flowing) window.
 const MAX_LINE_CHARS = MAX_TAIL_CHARS;
@@ -200,6 +210,10 @@ let termHeight = 0;
 
 // Panel enable flags (kept in sync with config; thinking/tools default true).
 let thinkingOn = true;
+/** SV-27: "turn" = the thinking panel carries the current turn only (the
+ * buffer is cleared on each new user message); "session" = accumulate every
+ * turn. Session-local; /split-thinking-scope, persisted by /split-save. */
+let thinkingScope: ThinkingScope = "turn";
 let toolsOn = true;
 let filesOn = false;
 /** Files panel edit-diff subpanel (session-local; /split-diff, persisted by
@@ -398,11 +412,15 @@ const thinking = {
 		if (this.current) total += this.current.lines.length;
 		return total;
 	},
-	reset() {
+	/** SV-27: `keepStreaming` preserves the live-stream indicator when the buffer
+	 * is cleared mid-turn (/split-thinking-scope turn while reasoning is still in
+	 * flight); the next thinking_delta rebuilds `current`. */
+	reset(keepStreaming = false) {
 		cancelPendingThinkFlush();
+		const wasStreaming = this.streaming;
 		this.blocks = [];
 		this.current = null;
-		this.streaming = false;
+		this.streaming = keepStreaming && wasStreaming;
 		this.version++;
 	},
 };
@@ -1138,9 +1156,18 @@ function panelMouse(
 	if (drag && (ev.type === "drag" || ev.type === "release")) return continueDrag(ev);
 	if (!ctl) return undefined;
 	if (ev.type === "wheel") {
-		// Body wheel uses native routing (contained in the panel's ScrollView).
-		if (where === "body" || !ctl.scroll) return undefined;
-		ctl.scroll.scrollBy(ev.wheelDelta ?? 0);
+		// SV-28: consume the wheel here instead of deferring the body to pi's
+		// native routing (routeWheel). That path hands whatever the panel's
+		// ScrollView did not consume to the PRIMARY scroll view — the transcript —
+		// even when the panel declares overscroll:"contain" (tui-alt-screen.js:
+		// `remaining !== 0 && !seen.has(primary)` runs regardless). So scrolling a
+		// panel to its top or bottom also scrolled the main window. Returning
+		// `handled` makes the TUI treat the wheel as consumed and skip routeWheel
+		// entirely, keeping the scroll inside this panel. A body with no
+		// ScrollView of its own (the files dock lists without one) consumes it too:
+		// doing nothing is better than scrolling the transcript from under the
+		// cursor.
+		ctl.scroll?.scrollBy(ev.wheelDelta ?? 0);
 		return { handled: true };
 	}
 	if (ev.button !== "left") return undefined;
@@ -1260,6 +1287,9 @@ class RecentBody implements Component {
 		/** Rows to guarantee so the left edge has no gaps (viewport height). */
 		private minRows: () => number,
 		private ctl?: PanelCtl,
+		/** SV-27: false = emit every row of the source instead of the newest
+		 * MAX_BODY_ROWS window. See BandDef.windowed. */
+		private windowed = true,
 	) {}
 	render(width: number): string[] {
 		const th = this.theme;
@@ -1296,12 +1326,18 @@ class RecentBody implements Component {
 		const src = this.lines(width);
 		const groups: { frags: string[]; raw: boolean }[] = [];
 		let used = 0;
+		// SV-27: a non-windowed body walks the source back to its START — no
+		// sliding window, so a panel scrolled away from the end keeps its
+		// position — but it is still bounded by VISUAL rows: MAX_LINES counts
+		// LOGICAL lines and one of them can wrap into hundreds. Past the cap it
+		// degrades to the windowed behaviour rather than rendering without limit.
+		const cap = this.windowed ? MAX_BODY_ROWS : MAX_UNWINDOWED_ROWS;
 		for (let i = src.length - 1; i >= 0; i--) {
 			const { frags, raw } = this.itemFrags(src[i], width, memo, nextMemo);
-			if (used + frags.length > MAX_BODY_ROWS) {
-				if (groups.length === 0 && frags.length > MAX_BODY_ROWS)
+			if (used + frags.length > cap) {
+				if (groups.length === 0 && frags.length > cap)
 					groups.push({
-						frags: raw ? frags : frags.slice(frags.length - MAX_BODY_ROWS),
+						frags: raw ? frags : frags.slice(frags.length - cap),
 						raw,
 					});
 				break;
@@ -1584,6 +1620,9 @@ interface BandDef {
 	lines: (width: number) => BodyItem[];
 	version: () => number;
 	empty: string;
+	/** SV-27: false = the body emits its whole row source instead of the newest
+	 * MAX_BODY_ROWS window. Defaults to true (windowed). */
+	windowed?: boolean;
 }
 
 function bandDef(theme: Theme, id: "thinking" | "tools"): BandDef {
@@ -1596,6 +1635,11 @@ function bandDef(theme: Theme, id: "thinking" | "tools"): BandDef {
 				lines: (w) => thinkingLines(theme, w),
 				version: () => thinking.version,
 				empty: "Thinking idle",
+				// SV-27: the thinking buffer is already capped at MAX_LINES, and a
+				// sliding newest-N window makes a fixed scrollTop resolve to
+				// different text on every streaming flush — scroll up and the panel
+				// keeps sliding under you. Emit the whole buffer instead.
+				windowed: false,
 			}
 		: {
 				title: "Tool Usage",
@@ -1627,6 +1671,7 @@ function framedPanel(theme: Theme, d: BandDef, ctl: PanelCtl): Component {
 		d.empty,
 		() => ctl.scroll?.viewportHeight || bandHeight - 2,
 		ctl,
+		d.windowed ?? true,
 	);
 	const scroll = new ScrollView(body, {
 		follow: "end",
@@ -1982,15 +2027,20 @@ export default function (pi: ExtensionAPI) {
 		rebuildResponseDoc(ctx);
 
 		const branch = ctx.sessionManager.getBranch();
-		const thoughts: string[] = [];
+		// SV-27: the "turn" scope has to survive a restart / branch switch, so the
+		// reconstruction makes the same cut the live buffer does. Without this a
+		// resumed session would show every earlier turn until the next user
+		// message happened to clear it.
+		const turns: { isUser: boolean; thoughts: string[] }[] = [];
 		for (const entry of branch) {
 			if (entry.type !== "message") continue;
 			const msg = (entry as any).message;
 			if (!msg) continue;
+			const msgThoughts: string[] = [];
 			if (msg.role === "assistant" && Array.isArray(msg.content)) {
 				for (const c of msg.content) {
 					if (c?.type === "thinking" && typeof c.thinking === "string")
-						thoughts.push(c.thinking);
+						msgThoughts.push(c.thinking);
 					if (c?.type === "toolCall" && c.name) {
 						try {
 							// SV-17: rebuild the bounded tools buffer from the
@@ -2004,6 +2054,8 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			}
+			if (msg.role === "user" || msg.role === "assistant")
+				turns.push({ isUser: msg.role === "user", thoughts: msgThoughts });
 			// Reconstruct the last edit diff from persisted tool-result details.
 			if (msg.role === "toolResult" && msg.toolName === "edit") {
 				const d = msg.details;
@@ -2023,6 +2075,12 @@ export default function (pi: ExtensionAPI) {
 					/* skip */
 				}
 			}
+		}
+		const thoughts: string[] = [];
+		if (thinkingScope === "turn") {
+			for (const t of thoughtsSinceLastUser(turns)) thoughts.push(t);
+		} else {
+			for (const turn of turns) for (const t of turn.thoughts) thoughts.push(t);
 		}
 		if (thoughts.length) {
 			for (const t of thoughts) {
@@ -2051,6 +2109,7 @@ export default function (pi: ExtensionAPI) {
 			};
 		}
 		thinkingOn = cfg.thinking;
+		thinkingScope = cfg.thinkingScope;
 		toolsOn = cfg.tools;
 		toolMode = cfg.toolMode;
 		bandHeight = cfg.bandHeight;
@@ -2116,6 +2175,14 @@ export default function (pi: ExtensionAPI) {
 	// so tool-only / thinking-only rounds add nothing to the doc.
 	pi.on("message_start", (event) => {
 		const msg = (event as any).message;
+		// SV-27: a new user message starts a new turn — with thinkingScope
+		// "turn" the panel drops the previous turn's reasoning here (it stays in
+		// the transcript, and reconstruct() restores it on resume/branch switch).
+		// Clearing on thinking_start instead would wipe the earlier blocks of the
+		// SAME turn, since one assistant message can stream several of them.
+		if (msg?.role === "user" && thinkingScope === "turn") {
+			thinking.reset();
+		}
 		if (msg?.role === "user") addResponseMessage(msg);
 		if (anyPanelActive()) requestRender();
 	});
@@ -2428,6 +2495,27 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("split-thinking-scope", {
+		description:
+			"Thinking panel buffer: turn (current turn only) | session (all turns)",
+		handler: async (args, ctx) => {
+			if (ctx.mode !== "tui") return;
+			const arg = String(args ?? "").trim().toLowerCase();
+			if (arg === "turn") thinkingScope = "turn";
+			else if (arg === "session") thinkingScope = "session";
+			else thinkingScope = thinkingScope === "turn" ? "session" : "turn";
+			// Switching back to "turn" takes effect now instead of at the next
+			// user message, so the command's feedback matches the panel. The live
+			// stream indicator survives: `current` is rebuilt by the next delta.
+			if (thinkingScope === "turn") thinking.reset(true);
+			if (anyPanelActive()) requestRender();
+			ctx.ui.notify(
+				`Thinking panel: ${thinkingScope === "turn" ? "current turn only" : "all turns"}`,
+				"info",
+			);
+		},
+	});
+
 	pi.registerCommand("split-tools", {
 		description: "Toggle the tools panel within the band",
 		handler: async (_args, ctx) => {
@@ -2582,6 +2670,7 @@ export default function (pi: ExtensionAPI) {
 				files: filesEffective,
 				toolMode,
 				trimResponse,
+				thinkingScope,
 				bandHeight,
 				toolsWidthPct,
 				...(filesWidth === null ? {} : { filesWidth }),

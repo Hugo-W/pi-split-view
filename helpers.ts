@@ -166,6 +166,27 @@ export function outputPreview(
 	return { shown, hidden: lines.length - shown.length };
 }
 
+/** SV-27: the reasoning of the current turn. `turns` is the conversation in
+ * order; the result is every thought that follows the last user message, so a
+ * resumed or branch-switched session reconstructs the same slice the "turn"
+ * scope keeps live. With no user message yet, the whole sequence is one turn. */
+export function thoughtsSinceLastUser(
+	turns: ReadonlyArray<{ isUser: boolean; thoughts: readonly string[] }>,
+): string[] {
+	let start = 0;
+	for (let i = turns.length - 1; i >= 0; i--) {
+		if (turns[i]?.isUser) {
+			start = i + 1;
+			break;
+		}
+	}
+	const out: string[] = [];
+	for (let i = start; i < turns.length; i++) {
+		for (const thought of turns[i]?.thoughts ?? []) out.push(thought);
+	}
+	return out;
+}
+
 /** pi auto-discovers every *.ts in an extensions dir; no-op factory. */
 export default function (_pi: ExtensionAPI) {
 	/* shared helper module, not a real extension */

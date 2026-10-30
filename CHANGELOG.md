@@ -2,6 +2,41 @@
 
 Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `thinkingScope` config key, toggled with `/split-thinking-scope [turn|session]` (default
+  `turn`): the Thinking panel now carries only the current turn's reasoning. A new user
+  message clears the panel's buffer, so it no longer fills up with the reasoning of every
+  earlier turn; the text itself still lives in the transcript, and `session` restores the
+  previous accumulate-everything behaviour. An interrupted turn used to leave a dangling
+  streamed block behind, which the next `thinking.start()` then pushed into the history —
+  that residue is dropped along with the rest of the turn. `/split-save` persists the scope, and
+  a resumed or branch-switched session reconstructs the same slice instead of every turn.
+
+### Fixed
+
+- Scrolling the Thinking panel away from the end no longer slides under you while reasoning
+  streams. The panel body rebuilt a newest-`MAX_BODY_ROWS` window on every 50 ms flush, so a
+  fixed scroll offset resolved to different text each time a line arrived — scrolling up was
+  impossible to hold. The Thinking panel now walks its whole buffer back to the first row; the
+  Tool Usage panel keeps the windowed body it needs. That body is bounded by VISUAL rows
+  (`MAX_UNWINDOWED_ROWS`, 4x the normal window) rather than by `MAX_LINES`, because
+  `MAX_LINES` counts logical lines and one of them can wrap into hundreds. A buffer past
+  either cap still drops its oldest rows, so a very long single turn can shift under a
+  scrolled-away panel — that is the remaining limit.
+- Scrolling a panel to its top or bottom no longer scrolls the transcript as well. pi's wheel
+  routing (`tui-alt-screen.js`, `routeWheel`) hands whatever a nested `ScrollView` did not
+  consume to the PRIMARY scroll view even when that panel declares `overscroll: "contain"`,
+  so the wheel spilled into the main window at either end of a panel. Panel bodies now consume
+  the wheel themselves, which makes the TUI skip that routing entirely (`handleMouse` →
+  `handled` → `return { consume: true }`). A body without a `ScrollView` of its own — the files
+  dock list — consumes it as well: doing nothing beats scrolling the transcript from under the
+  cursor. Visible trade-off: the scrollbar's hover highlight
+  is no longer refreshed on wheel — the active-scroll highlight still is. The complete fix
+  belongs in pi-tui's `routeWheel`, which should stop before the primary fallback.
+
 ## [1.3.1] — 2026-10-27
 
 ### Fixed
