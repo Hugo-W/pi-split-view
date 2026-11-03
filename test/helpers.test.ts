@@ -99,13 +99,13 @@ test("normalizeConfig: filesWidth is a validated optional number", () => {
 });
 
 test("normalizeConfig: thinkingScope is a strict turn|session read", () => {
-	assert.equal(normalizeConfig({}).thinkingScope, "turn");
+	assert.equal(normalizeConfig({}).thinkingScope, "session");
 	assert.equal(normalizeConfig({ thinkingScope: "session" }).thinkingScope, "session");
 	assert.equal(normalizeConfig({ thinkingScope: "turn" }).thinkingScope, "turn");
-	// Anything that is not the literal "session" must fall back to the default.
-	assert.equal(normalizeConfig({ thinkingScope: "all" as never }).thinkingScope, "turn");
-	assert.equal(normalizeConfig({ thinkingScope: true as never }).thinkingScope, "turn");
-	assert.equal(normalizeConfig(null as never).thinkingScope, "turn");
+	// Anything that is not the literal "turn" must fall back to the default.
+	assert.equal(normalizeConfig({ thinkingScope: "all" as never }).thinkingScope, "session");
+	assert.equal(normalizeConfig({ thinkingScope: true as never }).thinkingScope, "session");
+	assert.equal(normalizeConfig(null as never).thinkingScope, "session");
 });
 
 test("thoughtsSinceLastUser keeps only the reasoning after the last user turn", () => {

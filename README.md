@@ -23,11 +23,11 @@ transcript mode — composed as one clean layout layer over pi's native transcri
 
 ## Features
 
-- **Thinking panel** — live reasoning stream (coalesced flushes, bounded buffers) scoped to
-  the current turn by default (`/split-thinking-scope`, config `thinkingScope`): a new user
-  message clears it, so the panel shows this turn's reasoning instead of every earlier turn's;
-  `session` keeps accumulating. The full text always stays in the transcript. Scrolling the
-  panel away from the end holds its position while new reasoning streams in.
+- **Thinking panel** — live reasoning stream (coalesced flushes, bounded buffers) that
+  accumulates across turns by default; `/split-thinking-scope turn` (config `thinkingScope`)
+  scopes it to the current turn instead, so a new user message clears it. The full text
+  always stays in the transcript. Scrolling the panel away from the end holds its position
+  while new reasoning streams in.
 - **Tool Usage panel** — every tool call with status/output preview, compact or full detail,
   and its duration (a live elapsed counter while it runs); history is rebuilt from the
   session branch on resume/branch switch. Zooming the panel (`[↗]`) expands every tool to
@@ -69,7 +69,7 @@ Drag-resizes behave like the matching commands: they last for the current window
 | --- | --- |
 | `/split` | full toggle pair: OFF = all panels off (bare pi layout), ON = the panel flags saved as startup defaults (falls back to thinking + tools if the saved layout has nothing on) |
 | `/split-thinking` | toggle the thinking panel within the band |
-| `/split-thinking-scope [turn\|session]` | thinking panel buffer: `turn` = current turn only, cleared on each new user message (default), `session` = keep every turn |
+| `/split-thinking-scope [turn\|session]` | thinking panel buffer: `session` = keep every turn (default), `turn` = current turn only, cleared on each new user message |
 | `/split-tools` | toggle the tool panel within the band |
 | `/split-tools-view` | compact ↔ full tool detail (full detail shows output previews and inline image results; zoom implies full detail) |
 | `/split-tools-width <pct>` | tools panel width as % of the band (20–60, default 35) |

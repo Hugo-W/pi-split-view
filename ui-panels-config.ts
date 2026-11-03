@@ -31,7 +31,8 @@ export interface UiPanelsConfig {
 	split?: boolean;
 	/** Thinking panel within the band. Defaults to true when absent. */
 	thinking?: boolean;
-	/** Thinking panel buffer scope. Defaults to "turn" when absent. */
+	/** Thinking panel buffer scope. Defaults to "session" (accumulate, the
+	 * pre-SV-27 behaviour) when absent. */
 	thinkingScope?: ThinkingScope;
 	/** Tools panel within the band. Defaults to true when absent. */
 	tools?: boolean;
@@ -116,9 +117,9 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 		diff: boolOr(root.diff, true),
 		answerDivider: root.answerDivider === "space" ? "space" : "rule",
 		toolMode: tm,
-		// SV-27: strict read — anything that is not the literal "session" falls
-		// back to the new "turn" default, so bad JSON can never widen the buffer.
-		thinkingScope: root.thinkingScope === "session" ? "session" : "turn",
+		// SV-27: strict read — only the literal "turn" opts in; anything else
+		// falls back to the "session" default, preserving the original behaviour.
+		thinkingScope: root.thinkingScope === "turn" ? "turn" : "session",
 		trimResponse: boolOr(root.trimResponse, false),
 		bandHeight,
 		toolsWidthPct,

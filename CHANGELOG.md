@@ -7,10 +7,10 @@ Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 ### Added
 
 - `thinkingScope` config key, toggled with `/split-thinking-scope [turn|session]` (default
-  `turn`): the Thinking panel now carries only the current turn's reasoning. A new user
-  message clears the panel's buffer, so it no longer fills up with the reasoning of every
-  earlier turn; the text itself still lives in the transcript, and `session` restores the
-  previous accumulate-everything behaviour. An interrupted turn used to leave a dangling
+  `session`, the existing accumulate-everything behaviour). `turn` makes the Thinking panel
+  carry only the current turn's reasoning: a new user message clears the panel's buffer, so it
+  no longer fills up with the reasoning of every earlier turn; the text itself still lives in
+  the transcript. An interrupted turn used to leave a dangling
   streamed block behind, which the next `thinking.start()` then pushed into the history —
   that residue is dropped along with the rest of the turn. `/split-save` persists the scope, and
   a resumed or branch-switched session reconstructs the same slice instead of every turn.

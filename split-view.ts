@@ -212,8 +212,9 @@ let termHeight = 0;
 let thinkingOn = true;
 /** SV-27: "turn" = the thinking panel carries the current turn only (the
  * buffer is cleared on each new user message); "session" = accumulate every
- * turn. Session-local; /split-thinking-scope, persisted by /split-save. */
-let thinkingScope: ThinkingScope = "turn";
+ * turn (default, the pre-SV-27 behaviour). Session-local;
+ * /split-thinking-scope, persisted by /split-save. */
+let thinkingScope: ThinkingScope = "session";
 let toolsOn = true;
 let filesOn = false;
 /** Files panel edit-diff subpanel (session-local; /split-diff, persisted by
