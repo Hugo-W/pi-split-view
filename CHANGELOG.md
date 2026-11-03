@@ -2,7 +2,7 @@
 
 Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.4.0] — 2026-11-03
 
 ### Added
 
