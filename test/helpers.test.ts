@@ -7,7 +7,10 @@ import {
 	capToolText,
 	dockColsFor,
 	formatDuration,
+	headTailPreview,
+	isCappedToolText,
 	lastImageBlock,
+	liveTailLines,
 	outputPreview,
 	thoughtsSinceLastUser,
 	truncateInline,
@@ -174,4 +177,67 @@ test("outputPreview shows the first `cap` lines and counts the hidden rest", () 
 	assert.deepEqual(outputPreview(["a", "b"], 0), { shown: [], hidden: 2 });
 	// A cap larger than the list hides nothing.
 	assert.deepEqual(outputPreview(["a"], 20), { shown: ["a"], hidden: 0 });
+});
+
+test("headTailPreview shows head, hidden count, and tail without duplication", () => {
+	// Fits entirely: everything goes to head, tail stays empty (no dupes).
+	assert.deepEqual(headTailPreview(["a", "b", "c"], 1, 2), {
+		head: ["a", "b", "c"],
+		hidden: 0,
+		tail: [],
+	});
+	assert.deepEqual(headTailPreview([], 1, 2), { head: [], hidden: 0, tail: [] });
+	// Longer than head+tail: first line, hidden middle count, last 2 lines.
+	assert.deepEqual(headTailPreview(["a", "b", "c", "d", "e"], 1, 2), {
+		head: ["a"],
+		hidden: 2,
+		tail: ["d", "e"],
+	});
+	// Exactly head+tail: still the whole list, nothing hidden.
+	assert.deepEqual(headTailPreview(["a", "b", "c"], 1, 2), {
+		head: ["a", "b", "c"],
+		hidden: 0,
+		tail: [],
+	});
+	// tail larger than the list: slice handles it, everything in head.
+	assert.deepEqual(headTailPreview(["a", "b"], 1, 5), {
+		head: ["a", "b"],
+		hidden: 0,
+		tail: [],
+	});
+});
+
+test("headTailPreview counts hidden lines against the real total", () => {
+	// A 20-line stored window of a 100-line output: hidden = 100 - 1 - 2.
+	const win = Array.from({ length: 20 }, (_, i) => `l${81 + i}`);
+	const r = headTailPreview(win, 1, 2, 100);
+	assert.equal(r.hidden, 97);
+	assert.deepEqual(r.tail, ["l99", "l100"]);
+	// A total smaller than the list is ignored (never negative / undercounted).
+	assert.equal(headTailPreview(["a", "b", "c", "d"], 1, 2, 1).hidden, 1);
+	// Short window of a longer output: all shown, the rest counted.
+	assert.deepEqual(headTailPreview(["a", "b"], 1, 2, 5), { head: ["a", "b"], hidden: 3, tail: [] });
+});
+
+test("isCappedToolText recognises capToolText's marker", () => {
+	assert.equal(isCappedToolText(capToolText("x".repeat(100), 50)), true);
+	assert.equal(isCappedToolText("plain output"), false);
+});
+
+test("liveTailLines keeps indentation, blanks and the newest lines", () => {
+	assert.deepEqual(liveTailLines("a\n  b\n\nc\n\n", 10), { lines: ["a", "  b", "", "c"], hidden: 0 });
+	assert.deepEqual(liveTailLines("1\n2\n3\n4", 2), { lines: ["3", "4"], hidden: 2 });
+	assert.deepEqual(liveTailLines("", 5), { lines: [], hidden: 0 });
+});
+
+test("liveTailLines sanitises escapes, carriage returns and tabs", () => {
+	// Colours and OSC hyperlinks are dropped; a CRLF ending is harmless.
+	assert.deepEqual(
+		liveTailLines("\x1b[31mred\x1b[0m\r\n\x1b]8;;http://x\x07link\x1b]8;;\x07", 5).lines,
+		["red", "link"],
+	);
+	// Progress bar redraws: only the text after the last \r stays.
+	assert.deepEqual(liveTailLines("10%\r50%\r100%", 5).lines, ["100%"]);
+	// Tabs expand to 8-column stops; other control chars vanish.
+	assert.deepEqual(liveTailLines("a\tb\x07", 5).lines, ["a       b"]);
 });

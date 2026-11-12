@@ -2,6 +2,28 @@
 
 Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 
+## [1.5.0] — 2026-11-12
+
+### Added
+
+- Live-output view for the Tool Usage panel. While a tool that streams partial results
+  runs (`tool_execution_update`, e.g. `bash`), a `[▶]` button appears at the right end of
+  the panel's bottom frame (away from the header's zoom/close buttons): it pins the panel
+  to the newest running streaming tool and shows its raw output stream (last 300 lines,
+  indentation and blank lines kept, long lines wrapped, colours/progress-bar `\r` redraws
+  cleaned up) instead of the trimmed 20-line preview, tail-following, in band and zoomed
+  view alike. The pinned tool never changes on its own: a newer streaming tool is only
+  announced in the status line, and live mode stays on after the tool ends (status turns to
+  finished/failed) so the output can still be read. `[◼]` leaves it.
+  `/split-tools-live` pins the newest streaming tool, opens a picker when there is a
+  choice (several streaming tools, or switching away from the pinned one), and
+  `/split-tools-live off` leaves live mode.
+- Head+tail output preview in the unzoomed full-detail mode of the Tool Usage panel: the
+  output's true first line (captured when output was first seen, since the stored buffer
+  keeps only the last 20 lines), a `+N more` marker counting the real hidden lines, then
+  the last 2 lines, so a running command's fresh tail stays visible instead of the oldest
+  lines of the stored window.
+
 ## [1.4.0] — 2026-11-03
 
 ### Added

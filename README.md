@@ -30,10 +30,19 @@ transcript mode — composed as one clean layout layer over pi's native transcri
   while new reasoning streams in.
 - **Tool Usage panel** — every tool call with status/output preview, compact or full detail,
   and its duration (a live elapsed counter while it runs); history is rebuilt from the
-  session branch on resume/branch switch. Zooming the panel (`[↗]`) expands every tool to
-  its full stored output, and tool results that contain images (e.g. `read` on an image
-  file) render inline in full detail / zoomed views on terminals with image support
-  (Kitty/iTerm2), with pi's text fallback otherwise — the same behaviour as pi's native
+  session branch on resume/branch switch. In full detail the output preview is head+tail
+  (the output's true first line, `+N more`, last 2 lines), so a running command's fresh
+  output is visible.
+  While a tool that streams partial output runs (e.g. `bash`), a `[▶]` button appears at
+  the right end of the panel's bottom frame: it pins the panel to that tool's raw output
+  stream (last 300 lines, indentation kept, tail-following). The pinned tool never changes
+  on its own — a newer streaming tool is only announced in the status line — and live mode
+  stays on after the tool ends, so you can keep reading; `[◼]` leaves it, and
+  `/split-tools-live` picks among several streaming tools.
+  Zooming the panel (`[↗]`) expands every tool to its full stored output, and tool
+  results that contain images (e.g. `read` on an image file) render inline in full detail /
+  zoomed views on terminals with image support (Kitty/iTerm2), with pi's text fallback
+  otherwise — the same behaviour as pi's native
   transcript.
 - **Files panel** — right dock in fullscreen (or a passive overlay in regular mode) listing
   read/written/seen files newest-first, with a live edit-diff subpanel (hide the subpanel
@@ -54,6 +63,7 @@ transcript mode — composed as one clean layout layer over pi's native transcri
 | Where | Action |
 | --- | --- |
 | `[↗]` / `[↙]` in a panel header | expand the panel over the whole area above the editor / restore (a zoomed Tool Usage panel always shows full detail) |
+| `[▶]` / `[◼]` on the Tool Usage bottom frame | pin the panel to the raw live output of the newest streaming tool (`[▶]` appears while one streams; `[◼]` while live mode is on) / back to all tools |
 | `[×]` in a panel header | hide the panel (its command brings it back) |
 | band's bottom border, or the line under the band | drag to change the band height |
 | left edge of the Tool Usage panel | drag to change the thinking ↔ tools split |
@@ -71,7 +81,8 @@ Drag-resizes behave like the matching commands: they last for the current window
 | `/split-thinking` | toggle the thinking panel within the band |
 | `/split-thinking-scope [turn\|session]` | thinking panel buffer: `session` = keep every turn (default), `turn` = current turn only, cleared on each new user message |
 | `/split-tools` | toggle the tool panel within the band |
-| `/split-tools-view` | compact ↔ full tool detail (full detail shows output previews and inline image results; zoom implies full detail) |
+| `/split-tools-view` | compact ↔ full tool detail (full detail shows a head+tail output preview and inline image results; zoom implies full detail) |
+| `/split-tools-live [off]` | live output of a streaming tool in the tool panel: pins the newest one, or opens a picker when there is a choice (several streaming tools, or switching away from the pinned one); `off` returns to all tools |
 | `/split-tools-width <pct>` | tools panel width as % of the band (20–60, default 35) |
 | `/files` | toggle the files panel (dock in fullscreen, overlay in regular mode) |
 | `/split-diff` | toggle the files panel's edit-diff subpanel (keep the file list only) |

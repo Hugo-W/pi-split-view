@@ -166,6 +166,64 @@ export function outputPreview(
 	return { shown, hidden: lines.length - shown.length };
 }
 
+/** Head+tail preview: the first `head` lines, a hidden count, and the last
+ * `tail` lines, so a running command's fresh tail stays visible while the
+ * start of the output is not lost. When everything fits, `head` is the whole
+ * list and `tail` is empty (no line is duplicated). `total` is the real line
+ * count when `lines` is only a stored window of a longer output (defaults to
+ * `lines.length`), so `hidden` counts what is really not shown. The caller
+ * renders the "+N more" marker between `head` and `tail`. */
+export function headTailPreview(
+	lines: string[],
+	head: number,
+	tail: number,
+	total = lines.length,
+): { head: string[]; hidden: number; tail: string[] } {
+	total = Math.max(total, lines.length);
+	if (lines.length <= head + tail)
+		return { head: lines.slice(), hidden: total - lines.length, tail: [] };
+	return {
+		head: lines.slice(0, head),
+		hidden: total - head - tail,
+		tail: lines.slice(lines.length - tail),
+	};
+}
+
+/** True if `s` was cut by capToolText (it starts with the truncation marker),
+ * i.e. its first line is the marker, not the output's real first line. */
+export function isCappedToolText(s: string): boolean {
+	return s.startsWith("[truncated: newest ");
+}
+
+/** Live-output view of a streaming tool: the last `max` lines of its raw
+ * output, shaped for a terminal-like panel. Unlike the trimmed previews it
+ * keeps indentation and blank lines; it drops escape sequences and control
+ * characters (a raw stream can carry colours or cursor moves that would
+ * corrupt the frame), keeps only what follows the last carriage return of a
+ * line (progress bars redraw with \r), expands tabs to 8-column stops and
+ * drops trailing blank lines. `hidden` counts the earlier lines left out. */
+export function liveTailLines(text: string, max: number): { lines: string[]; hidden: number } {
+	const all = text.split("\n");
+	while (all.length > 0 && all[all.length - 1].trim() === "") all.pop();
+	const start = Math.max(0, all.length - Math.max(0, max));
+	const lines = all.slice(start).map((raw) => {
+		const seg = raw
+			// CSI (colours, cursor moves) and OSC (titles, hyperlinks) sequences.
+			.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+			.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+			.split("\r")
+			.filter((p) => p !== "")
+			.pop() ?? "";
+		let out = "";
+		for (const ch of seg.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "")) {
+			if (ch === "\t") out += " ".repeat(8 - (out.length % 8));
+			else out += ch;
+		}
+		return out.trimEnd();
+	});
+	return { lines, hidden: start };
+}
+
 /** SV-27: the reasoning of the current turn. `turns` is the conversation in
  * order; the result is every thought that follows the last user message, so a
  * resumed or branch-switched session reconstructs the same slice the "turn"

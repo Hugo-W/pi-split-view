@@ -132,7 +132,10 @@ import {
 	capToolText,
 	dockColsFor as dockColsForManual,
 	formatDuration,
+	headTailPreview,
+	isCappedToolText,
 	lastImageBlock,
+	liveTailLines,
 	outputPreview,
 	truncateInline,
 	thoughtsSinceLastUser,
@@ -225,6 +228,17 @@ let showDiff = true;
  * persisted by /split-save. */
 let answerDividerMode: "rule" | "space" = "rule";
 let toolMode: ToolModeCfg = "compact";
+/** Live-output focus of the tools panel (bottom-frame [▶] /
+ * /split-tools-live): the id of the PINNED tool whose raw output stream the
+ * panel shows, or null. Pinned once chosen — a newer streaming tool never
+ * retargets it, and it stays on after the tool ends (the user may still be
+ * reading); only the user exits it, or the entry disappearing (eviction,
+ * session rebuild) clears it. Session-local. */
+let liveToolId: string | null = null;
+/** The tools panel's body ScrollView (band or zoomed; set on compose), so
+ * entering / leaving live mode can jump to the end of the swapped content
+ * instead of keeping a scroll offset that points into unrelated rows. */
+let toolsScroll: ScrollView | null = null;
 /** Panel C: response-only view instead of pi's transcript (persisted). */
 let trimResponse = false;
 /** Top band height in rows (6–40, persisted; /split-height). */
@@ -636,9 +650,56 @@ interface ToolEntry {
 	/** Wall-clock start/end (ms) of LIVE calls; absent for resumed history. */
 	startedAt?: number;
 	endedAt?: number;
+	/** The tool reported at least one partial result (tool_execution_update),
+	 * i.e. it streams output via onUpdate while running. */
+	streaming?: boolean;
+	/** The true first output line, captured the first time output was seen —
+	 * `output` itself keeps only the last MAX_TOOL_OUTPUT_LINES, so without
+	 * this the band's head+tail preview could not show the real first line.
+	 * null = unknown (the first text seen was already capped). */
+	firstLine?: string | null;
+	/** Non-blank lines in the last output text (the stored window is only the
+	 * last MAX_TOOL_OUTPUT_LINES of them), for an honest "+N more" count. */
+	outputLines?: number;
+	/** Raw latest output text (capped like every tool text) of a streaming
+	 * tool, for the live-output view — the stream itself, not the trimmed
+	 * 20-line window. Kept while the tool runs and, after it ends, only for
+	 * the pinned live tool; dropped otherwise. */
+	liveText?: string;
 }
 const toolsBy = new Map<string, ToolEntry>();
 const toolOrder: string[] = [];
+
+/** Running tools that stream partial output, oldest → newest. */
+function streamingActiveIds(): string[] {
+	return toolOrder.filter((id) => {
+		const e = toolsBy.get(id);
+		return !!e?.active && !!e.streaming;
+	});
+}
+
+/** The pinned live tool, if its entry still exists. */
+function liveEntry(): ToolEntry | undefined {
+	return liveToolId ? toolsBy.get(liveToolId) : undefined;
+}
+
+/** Bottom-frame live button: [▶] while some tool streams, [◼] while live
+ * mode is on (so there is always a way out, even after the stream ended).
+ * ONE predicate for both painting and hit-testing. */
+function liveButtonVisible(): boolean {
+	return liveToolId !== null || streamingActiveIds().length > 0;
+}
+
+/** Pin (or with null, leave) the live-output view. A finished tool that is
+ * no longer pinned drops its raw stream text. */
+function setLiveTool(id: string | null): void {
+	const prev = liveEntry();
+	if (prev && prev.id !== id && !prev.active) delete prev.liveText;
+	liveToolId = id;
+	toolsVersionCounter++;
+	toolsScroll?.scrollToEnd();
+	requestRender();
+}
 
 /** B1: 1 Hz ticker that refreshes running-tool elapsed counters; runs only
  * while a timed tool is active and stops itself afterwards. */
@@ -690,8 +751,21 @@ function argsJson(args: any): string {
 
 function setToolOutput(e: ToolEntry, text: string): void {
 	// SV-16: cap BEFORE splitting so the split never sees unbounded text.
-	const lines = capToolText(text).split(/\r?\n/);
+	const capped = capToolText(text);
+	const lines = capped.split(/\r?\n/);
 	e.output = lines.slice(-MAX_TOOL_OUTPUT_LINES).join("\n");
+	let nonBlank = 0;
+	for (const l of lines) if (l.trim()) nonBlank++;
+	e.outputLines = nonBlank;
+	// Capture the true first line only once: output accumulates from the start,
+	// so the first write still holds the beginning (later writes are tails) —
+	// unless that first write was already capped: then its first line is the
+	// truncation marker and the real one is unknown.
+	if (e.firstLine === undefined && nonBlank > 0) {
+		e.firstLine = isCappedToolText(capped)
+			? null
+			: lines.find((l) => l.trim().length > 0)!.trim();
+	}
 }
 
 /** SV-17: ingest one tool call through the SAME path for live events and
@@ -714,6 +788,7 @@ function ingestToolCall(id: string, name: string, args: any, startedAt?: number)
 	if (toolOrder.length > MAX_TOOLS) {
 		const evict = toolOrder.shift()!;
 		toolsBy.delete(evict);
+		if (evict === liveToolId) liveToolId = null;
 	}
 }
 
@@ -755,50 +830,78 @@ type BodyItem = string | { image: ImageBlock; maxRows?: number };
  * this many rows so they don't crowd the small panel. Zoomed: pi's default. */
 const BAND_IMAGE_ROWS = 6;
 
-/** Zoomed tools panel: show full detail for every tool — its whole stored
- * output (≤ MAX_TOOL_OUTPUT_LINES) instead of the 2-line band preview. */
-const toolOutputCap = (zoomedTools: boolean) =>
-	zoomedTools ? MAX_TOOL_OUTPUT_LINES : 2;
+/** Live view: at most this many of the newest raw output lines (below
+ * MAX_BODY_ROWS, so wrapped long lines usually still fit the body window). */
+const LIVE_MAX_LINES = 300;
+
+/** One tool's summary row: status mark, name, badge, duration, args. */
+function toolHeaderRow(th: Theme, e: ToolEntry, textWidth: number): string {
+	const mark = e.active
+		? th.fg("warning", "●")
+		: e.isError
+			? th.fg("error", "✗")
+			: th.fg("success", "✓");
+	const name = e.active
+		? th.fg("accent", e.name)
+		: e.isError
+			? th.fg("error", e.name)
+			: th.fg("success", e.name);
+	const badge = e.subagent ? th.fg("muted", `[${e.agent ?? "sub"}]`) : "";
+	// B1: duration (done) or live elapsed counter (running, from 1s on).
+	let dur = "";
+	if (e.startedAt !== undefined) {
+		if (e.endedAt !== undefined)
+			dur = th.fg("dim", ` ${formatDuration(e.endedAt - e.startedAt)}`);
+		else if (e.active && Date.now() - e.startedAt >= 1000)
+			dur = th.fg("warning", ` ${formatDuration(Date.now() - e.startedAt, true)}`);
+	}
+	const prefix = `${mark} ${name}${badge}${dur}`;
+	const room = textWidth - visibleWidth(prefix) - 1;
+	const args =
+		e.args && room >= 8
+			? th.fg("muted", ` ${truncateInline(e.args, room)}`)
+			: "";
+	return prefix + args;
+}
+
+/** Live-output view (bottom-frame [▶] / /split-tools-live): the pinned
+ * tool's raw output stream — indentation and blank lines kept, long lines
+ * wrapped by the body — instead of the trimmed 20-line preview. Shown
+ * regardless of zoom / compact mode. */
+function liveToolItems(th: Theme, e: ToolEntry, textWidth: number): BodyItem[] {
+	const out: BodyItem[] = [];
+	const state = e.active ? "running" : e.isError ? "failed" : "finished";
+	let status = ` ▶ live output · ${state}`;
+	const newer = streamingActiveIds().filter((id) => id !== e.id);
+	if (newer.length > 0) {
+		const n = toolsBy.get(newer[newer.length - 1])?.name ?? "tool";
+		status += ` · newer: ${n}${newer.length > 1 ? ` +${newer.length - 1}` : ""} running (/split-tools-live)`;
+	}
+	out.push(th.fg("dim", truncateInline(status, textWidth)));
+	out.push(toolHeaderRow(th, e, textWidth));
+	const { lines, hidden } = liveTailLines(e.liveText ?? e.output ?? "", LIVE_MAX_LINES);
+	if (hidden > 0) out.push(th.fg("dim", `  … ${hidden} earlier lines`));
+	if (lines.length === 0 && e.active) out.push(th.fg("dim", "  …"));
+	for (const l of lines) out.push(l ? th.fg("toolOutput", `  ${l}`) : "");
+	return out;
+}
 
 function toolItems(theme: Theme, width: number): BodyItem[] {
 	const th = theme;
+	// Text budget inside the frame: 1 col inset + ≥2 trailing pad cols
+	// (the transient scrollbar paints over the pad, never the frame).
+	const textWidth = Math.max(8, width - 3);
+	const live = liveEntry();
+	if (live) return liveToolItems(th, live, textWidth);
 	const out: BodyItem[] = [];
 	// Zooming the tools panel expands it over the whole area above the editor,
 	// so it always renders full detail regardless of the compact/full toggle.
 	const zoomedTools = zoomed === "tools";
 	const full = toolMode === "full" || zoomedTools;
-	// Text budget inside the frame: 1 col inset + ≥2 trailing pad cols
-	// (the transient scrollbar paints over the pad, never the frame).
-	const textWidth = Math.max(8, width - 3);
 	for (const id of toolOrder) {
 		const e = toolsBy.get(id);
 		if (!e) continue;
-		const mark = e.active
-			? th.fg("warning", "●")
-			: e.isError
-				? th.fg("error", "✗")
-				: th.fg("success", "✓");
-		const name = e.active
-			? th.fg("accent", e.name)
-			: e.isError
-				? th.fg("error", e.name)
-				: th.fg("success", e.name);
-		const badge = e.subagent ? th.fg("muted", `[${e.agent ?? "sub"}]`) : "";
-		// B1: duration (done) or live elapsed counter (running, from 1s on).
-		let dur = "";
-		if (e.startedAt !== undefined) {
-			if (e.endedAt !== undefined)
-				dur = th.fg("dim", ` ${formatDuration(e.endedAt - e.startedAt)}`);
-			else if (e.active && Date.now() - e.startedAt >= 1000)
-				dur = th.fg("warning", ` ${formatDuration(Date.now() - e.startedAt, true)}`);
-		}
-		const prefix = `${mark} ${name}${badge}${dur}`;
-		const room = textWidth - visibleWidth(prefix) - 1;
-		const args =
-			e.args && room >= 8
-				? th.fg("muted", ` ${truncateInline(e.args, room)}`)
-				: "";
-		out.push(prefix + args);
+		out.push(toolHeaderRow(th, e, textWidth));
 		if (!full) {
 			if (out.length > 1) out.splice(out.length - 1, 0, "");
 			continue;
@@ -809,11 +912,24 @@ function toolItems(theme: Theme, width: number): BodyItem[] {
 			.filter(Boolean);
 		if (content.length === 0) {
 			if (e.active) out.push(th.fg("dim", "  · …"));
-		} else {
-			const { shown, hidden } = outputPreview(content, toolOutputCap(zoomedTools));
+		} else if (zoomedTools) {
+			// Zoomed: the whole stored output (≤ MAX_TOOL_OUTPUT_LINES).
+			const { shown, hidden } = outputPreview(content, MAX_TOOL_OUTPUT_LINES);
 			for (const l of shown)
 				out.push(th.fg("toolOutput", `  · ${truncateInline(l, textWidth - 4)}`));
 			if (hidden > 0) out.push(th.fg("dim", `  · +${hidden} more`));
+		} else {
+			// Band full detail: head+tail preview — the output's true first line
+			// (e.firstLine, kept from when output was first seen), "+N more",
+			// last 2 lines — so a running tool's fresh tail stays visible (pi's
+			// own transcript previews with keep:"end" for the same reason).
+			const { head, hidden, tail } = headTailPreview(content, 1, 2, e.outputLines);
+			if (hidden > 0 && e.firstLine) head[0] = e.firstLine;
+			const row = (l: string, dim = false) =>
+				out.push(th.fg(dim ? "dim" : "toolOutput", `  · ${truncateInline(l, textWidth - 4)}`));
+			for (const l of head) row(l);
+			if (hidden > 0) row(`+${hidden} more`, true);
+			for (const l of tail) row(l);
 		}
 		// Zoomed: an edit's diff, rendered like pi's transcript (renderDiff
 		// colours +/- lines); long lines wrap in the body.
@@ -1122,6 +1238,22 @@ function buttonAt(ev: TuiMouseEvent): "zoom" | "close" | null {
 	return null;
 }
 
+/** Tools panel bottom frame: the live-output button sits at the right end,
+ * `╰──…──[▶]─╯`, away from the header's zoom/close buttons. Shown while a
+ * tool streams ([▶]) or live mode is on ([◼]); needs the same minimum width
+ * as the header buttons. Its columns: [width-5, width-2). */
+function liveButtonShown(id: PanelId | undefined, width: number): boolean {
+	return id === "tools" && width - 2 >= HEADER_BUTTONS_MIN && liveButtonVisible();
+}
+function liveButtonAt(ev: TuiMouseEvent, id: PanelId): boolean {
+	return (
+		ev.y === 0 &&
+		liveButtonShown(id, ev.width) &&
+		ev.x >= ev.width - 5 &&
+		ev.x < ev.width - 2
+	);
+}
+
 function recompose(): void {
 	if (themeGetter) reconcileLayout(themeGetter());
 }
@@ -1129,6 +1261,20 @@ function recompose(): void {
 function toggleZoom(id: PanelId): void {
 	zoomed = zoomed === id ? null : id;
 	recompose();
+}
+
+/** Bottom-frame button: leave live mode, or pin the newest running
+ * streaming tool. (The command offers a picker for the other cases.) */
+function toggleToolsLive(): void {
+	if (liveToolId !== null) {
+		setLiveTool(null);
+		notifyFn?.("Tool panel: all tools", "info");
+		return;
+	}
+	const id = streamingActiveIds().pop();
+	if (!id) return;
+	setLiveTool(id);
+	notifyFn?.(`Tool panel: live output of ${toolsBy.get(id)?.name ?? "tool"}`, "info");
 }
 
 const PANEL_LABELS: Record<PanelId, [string, string]> = {
@@ -1174,6 +1320,7 @@ function panelMouse(
 	if (ev.button !== "left") return undefined;
 	if (ev.type === "press") {
 		if (where === "top" && buttonAt(ev)) return { capture: true };
+		if (where === "bottom" && liveButtonAt(ev, ctl.id)) return { capture: true };
 		if (ctl.resizeLeft && ev.x === 0)
 			return beginDrag(ctl.id === "files" ? "dock" : "tools", ev);
 		if (where === "bottom" && ctl.inBand) return beginDrag("height", ev);
@@ -1184,6 +1331,10 @@ function panelMouse(
 		if (b === "zoom") toggleZoom(ctl.id);
 		else if (b === "close") hidePanel(ctl.id);
 		if (b) return { handled: true };
+	}
+	if (ev.type === "click" && where === "bottom" && liveButtonAt(ev, ctl.id)) {
+		toggleToolsLive();
+		return { handled: true };
 	}
 	return undefined;
 }
@@ -1223,10 +1374,19 @@ class BorderBottom implements Component {
 		private ctl?: PanelCtl,
 	) {}
 	render(width: number): string[] {
+		const th = this.theme;
+		if (liveButtonShown(this.ctl?.id, width)) {
+			const on = liveToolId !== null;
+			return [
+				th.fg("border", "╰" + "─".repeat(width - 6)) +
+					th.fg(on ? "warning" : "muted", on ? "[◼]" : "[▶]") +
+					th.fg("border", "─╯"),
+			];
+		}
 		return [
-			this.theme.fg("border", "╰") +
-				this.theme.fg("border", "─".repeat(Math.max(0, width - 2))) +
-				this.theme.fg("border", "╯"),
+			th.fg("border", "╰") +
+				th.fg("border", "─".repeat(Math.max(0, width - 2))) +
+				th.fg("border", "╯"),
 		];
 	}
 	handleMouse(ev: TuiMouseEvent): TuiMouseEventResult | undefined {
@@ -1685,6 +1845,7 @@ function framedPanel(theme: Theme, d: BandDef, ctl: PanelCtl): Component {
 			theme.fg(t === "█" ? "accent" : "border", t === "┃" ? "│" : t),
 	});
 	ctl.scroll = scroll;
+	if (ctl.id === "tools") toolsScroll = scroll;
 	return new MeasurementSafeVStack([
 		{ component: new BorderTop(theme, d.title, d.color, d.streaming, ctl), basis: 1, grow: 0, shrink: 0 },
 		{ component: scroll, basis: 0, grow: 1, shrink: 1, minSize: 1 },
@@ -2021,6 +2182,7 @@ export default function (pi: ExtensionAPI) {
 		thinking.reset();
 		toolsBy.clear();
 		toolOrder.length = 0;
+		liveToolId = null;
 		toolsVersionCounter++;
 		files.clear();
 		bumpFilesVersion();
@@ -2201,7 +2363,14 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_execution_update", (event) => {
 		const e = toolsBy.get(event.toolCallId);
 		if (e) {
-			setToolOutput(e, resultText((event as any).partialResult));
+			// First partial result ⇒ the tool streams via onUpdate: it is a
+			// candidate for the panel's live-output mode (bottom-frame [▶]).
+			// The raw (capped) snapshot feeds the live view directly; it costs
+			// one string reference, the text is allocated by resultText anyway.
+			e.streaming = true;
+			const text = resultText((event as any).partialResult);
+			setToolOutput(e, text);
+			e.liveText = text;
 			markToolsDirty();
 		}
 		if (anyPanelActive()) requestRender();
@@ -2209,6 +2378,16 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_execution_end", (event) => {
 		// SV-17: same ingest path the branch rebuild uses.
 		ingestToolResult(event.toolCallId, (event as any).result, event.isError, Date.now());
+		// Live mode is NOT left here: the user may still be reading the output.
+		// The pinned tool keeps its final text (status turns to finished/failed);
+		// any other finished streamer drops its raw stream text.
+		const e = toolsBy.get(event.toolCallId);
+		if (e?.streaming) {
+			if (e.id === liveToolId) {
+				const final = resultText((event as any).result);
+				if (final) e.liveText = final;
+			} else delete e.liveText;
+		}
 		if (anyPanelActive()) requestRender();
 	});
 
@@ -2551,6 +2730,52 @@ export default function (pi: ExtensionAPI) {
 			toolsVersionCounter++;
 			ctx.ui.notify(`Tool panel: ${toolMode}`, "info");
 			requestRender();
+		},
+	});
+
+	pi.registerCommand("split-tools-live", {
+		description:
+			"Live output of a streaming tool in the tool panel (picker if several; 'off' to leave)",
+		handler: async (args, ctx) => {
+			if (args.trim() === "off") {
+				if (liveToolId !== null) setLiveTool(null);
+				ctx.ui.notify("Tool panel: all tools", "info");
+				return;
+			}
+			// Candidates: running streaming tools other than the pinned one,
+			// newest first.
+			const cands = streamingActiveIds()
+				.filter((id) => id !== liveToolId)
+				.reverse();
+			if (cands.length === 0) {
+				if (liveToolId !== null) {
+					setLiveTool(null);
+					ctx.ui.notify("Tool panel: all tools", "info");
+				} else ctx.ui.notify("No streaming tool is running", "info");
+				return;
+			}
+			let pick: string | undefined = cands[0];
+			if (cands.length > 1 || liveToolId !== null) {
+				const EXIT = "Exit live view (all tools)";
+				const labels = cands.map((id, i) => {
+					const e = toolsBy.get(id)!;
+					const t = e.startedAt ? ` · ${formatDuration(Date.now() - e.startedAt, true)}` : "";
+					return `${i + 1}. ${e.name}${t} · ${truncateInline(e.args, 60)}`;
+				});
+				const options = liveToolId !== null ? [...labels, EXIT] : labels;
+				const choice = await ctx.ui.select("Live output of which tool?", options);
+				if (choice === undefined) return;
+				if (choice === EXIT) {
+					setLiveTool(null);
+					ctx.ui.notify("Tool panel: all tools", "info");
+					return;
+				}
+				pick = cands[labels.indexOf(choice)];
+			}
+			// The tool may have been evicted while the picker was open.
+			if (!pick || !toolsBy.has(pick)) return;
+			setLiveTool(pick);
+			ctx.ui.notify(`Tool panel: live output of ${toolsBy.get(pick)!.name}`, "info");
 		},
 	});
 
